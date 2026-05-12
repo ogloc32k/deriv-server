@@ -21,7 +21,25 @@ function addLog(msg) {
   broadcast(JSON.stringify({ logs: [entry] }));
 }
 
+function broadcastFullState() {
+  // send only dynamic fields + settings that change rarely
+  const slim = {
+    active: state.active,
+    balance: state.balance,
+    currency: state.currency,
+    runningProfit: state.runningProfit,
+    latestTick: state.latestTick,
+    formattedPrice: state.formattedPrice,
+    lastDigit: state.lastDigit,
+    // Include config only when mode changes? Simpler: send them once on request, not continuously.
+    // We'll send them via /api/state on page load only.
+    // So broadcast only the above fields.
+  };
+  sseClients.forEach(c => c.write(`data: ${JSON.stringify({ state: slim })}\n\n`));
+}
+
 function broadcast(data) {
+  // used for logs only
   sseClients.forEach(c => c.write(`data: ${data}\n\n`));
 }
 
@@ -39,7 +57,11 @@ const state = {
   active: false,
   marketSymbol: 'R_100',
   dp: MARKETS['R_100'].dp,
-  triggerDigits: '',
+  triggerMode: 'single',
+  triggerDigits: '',               // single mode list
+  clusterDigits: '',              // cluster digit list
+  clusterSize: 2,
+  lastDigitsBuffer: [],
   barrierDigit: '3',
   directionOverUnder: 'over',
   stake: 1.0,
@@ -58,7 +80,7 @@ const state = {
   logs: []
 };
 
-// ---------- SSE endpoint ----------
+// ---------- SSE endpoint (sends only dynamic state + logs) ----------
 app.get('/api/logs', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -67,10 +89,12 @@ app.get('/api/logs', (req, res) => {
   });
   res.write('\n');
   sseClients.add(res);
-  res.write(`data: ${JSON.stringify({ state })}\n\n`);
+  // Send full initial state once (all settings) then only slim updates
+  res.write(`data: ${JSON.stringify({ state: { ...state, logs: undefined } })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
 
+// Full state endpoint (used by UI on load)
 app.get('/api/state', (req, res) => {
   res.json({ ...state, logs: undefined });
 });
@@ -84,27 +108,37 @@ app.post('/api/control', (req, res) => {
     state.currentStake = state.stake;
     state.waitingForResult = false;
     state.pendingContractId = null;
+    state.lastDigitsBuffer = [];
     addLog('Trading started.');
+    broadcastFullState();
     res.json({ success: true, state });
   }
   else if (action === 'stop') {
     state.active = false;
     addLog('Trading stopped.');
+    broadcastFullState();
     res.json({ success: true, state });
   }
   else if (action === 'update') {
-    const { marketSymbol, triggerDigits, barrierDigit, directionOverUnder,
-            stake, martingale, takeProfit, stopLoss } = req.body;
+    const {
+      marketSymbol, triggerMode, triggerDigits,
+      clusterDigits, clusterSize,
+      barrierDigit, directionOverUnder,
+      stake, martingale, takeProfit, stopLoss
+    } = req.body;
 
     if (marketSymbol && MARKETS[marketSymbol]) {
       state.marketSymbol = marketSymbol;
       state.dp = MARKETS[marketSymbol].dp;
-      // re‑subscribe ticks for the new market
+      state.lastDigitsBuffer = [];
       if (derivWs && derivWs.readyState === WebSocket.OPEN) {
         send({ ticks: state.marketSymbol, req_id: ++reqId });
       }
     }
+    if (triggerMode) state.triggerMode = triggerMode;
     if (triggerDigits !== undefined) state.triggerDigits = String(triggerDigits).replace(/\s/g, '');
+    if (clusterDigits !== undefined) state.clusterDigits = String(clusterDigits).replace(/\s/g, '');
+    if (clusterSize !== undefined) state.clusterSize = parseInt(clusterSize) || 2;
     if (barrierDigit !== undefined) state.barrierDigit = String(barrierDigit);
     if (directionOverUnder) state.directionOverUnder = directionOverUnder;
     if (stake !== undefined) {
@@ -174,10 +208,9 @@ function handleDerivMessage(msg) {
   else if (msg.msg_type === 'balance') {
     state.balance = msg.balance.balance;
     state.currency = msg.balance.currency;
-    broadcast(JSON.stringify({ state }));
+    broadcastFullState();
   }
   else if (msg.msg_type === 'tick') {
-    // ✅ Only process ticks for the currently selected market
     if (msg.tick.symbol !== state.marketSymbol) return;
 
     const rawPrice = msg.tick.quote;
@@ -185,19 +218,46 @@ function handleDerivMessage(msg) {
     const formatted = parseFloat(rawPrice).toFixed(state.dp);
     state.formattedPrice = formatted;
     state.lastDigit = formatted.slice(-1);
-    broadcast(JSON.stringify({ state }));
+    broadcastFullState();
 
     if (!state.active || state.waitingForResult) return;
 
-    const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-    let tradeNow = false;
-    if (triggerSet.length === 0) {
-      tradeNow = true;   // empty → every tick triggers a trade
-    } else {
-      if (triggerSet.includes(state.lastDigit)) tradeNow = true;
+    // Maintain rolling buffer for last N digits
+    state.lastDigitsBuffer.push(state.lastDigit);
+    if (state.lastDigitsBuffer.length > state.clusterSize) {
+      state.lastDigitsBuffer.shift();
     }
 
-    if (tradeNow) startTrade(rawPrice);
+    let tradeNow = false;
+    let triggerReason = '';
+
+    if (state.triggerMode === 'single') {
+      const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
+      if (triggerSet.length === 0) {
+        tradeNow = true;
+        triggerReason = 'all';
+      } else if (triggerSet.includes(state.lastDigit)) {
+        tradeNow = true;
+        triggerReason = `single: ${state.lastDigit}`;
+      }
+    }
+    else if (state.triggerMode === 'cluster') {
+      if (state.lastDigitsBuffer.length === state.clusterSize) {
+        const clusterSet = state.clusterDigits.split(',').map(d => d.trim()).filter(d => d !== '');
+        if (clusterSet.length === 0) {
+          tradeNow = true;
+          triggerReason = 'cluster: any (empty set)';
+        } else {
+          const allInSet = state.lastDigitsBuffer.every(d => clusterSet.includes(d));
+          if (allInSet) {
+            tradeNow = true;
+            triggerReason = `cluster: [${state.lastDigitsBuffer.join(',')}] ∈ {${clusterSet.join(',')}}`;
+          }
+        }
+      }
+    }
+
+    if (tradeNow) startTrade(triggerReason);
   }
   else if (msg.msg_type === 'proposal') {
     const proposalId = msg.proposal.id;
@@ -226,7 +286,7 @@ function handleDerivMessage(msg) {
 
       state.pendingContractId = null;
       state.waitingForResult = false;
-      broadcast(JSON.stringify({ state }));
+      broadcastFullState();
 
       if (state.runningProfit >= state.takeProfit) {
         addLog(`Take Profit reached (${state.runningProfit.toFixed(2)}). Stopping.`);
@@ -239,7 +299,7 @@ function handleDerivMessage(msg) {
   }
 }
 
-function startTrade(currentPrice) {
+function startTrade(reason) {
   if (!state.active || state.waitingForResult) return;
 
   state.waitingForResult = true;
@@ -247,7 +307,7 @@ function startTrade(currentPrice) {
   const contractType = state.directionOverUnder === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
   const barrier = parseInt(state.barrierDigit);
 
-  addLog(`Placing ${contractType} barrier ${barrier} | trigger digit(s): ${state.triggerDigits || 'all'}`);
+  addLog(`Placing ${contractType} barrier ${barrier} | trigger: ${reason}`);
 
   send({
     proposal: 1,
@@ -256,7 +316,7 @@ function startTrade(currentPrice) {
     currency: state.currency,
     duration: 1,
     duration_unit: 't',
-    symbol: state.marketSymbol,          // ✅ FIXED: was underlying_symbol
+    symbol: state.marketSymbol,
     contract_type: contractType,
     barrier: barrier,
     req_id: ++reqId
