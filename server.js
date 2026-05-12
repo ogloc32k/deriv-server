@@ -18,29 +18,15 @@ function addLog(msg) {
   const entry = { id: logId++, time: new Date().toISOString(), message: msg };
   state.logs.unshift(entry);
   if (state.logs.length > 200) state.logs.pop();
-  broadcast(JSON.stringify({ logs: [entry] }));
+  broadcastState(); // send full state so logs appear immediately
+  // Also broadcast the log entry separately so the UI can prepend it cleanly
+  sseClients.forEach(c => c.write(`data: ${JSON.stringify({ logs: [entry] })}\n\n`));
 }
 
-function broadcastFullState() {
-  // send only dynamic fields + settings that change rarely
-  const slim = {
-    active: state.active,
-    balance: state.balance,
-    currency: state.currency,
-    runningProfit: state.runningProfit,
-    latestTick: state.latestTick,
-    formattedPrice: state.formattedPrice,
-    lastDigit: state.lastDigit,
-    // Include config only when mode changes? Simpler: send them once on request, not continuously.
-    // We'll send them via /api/state on page load only.
-    // So broadcast only the above fields.
-  };
-  sseClients.forEach(c => c.write(`data: ${JSON.stringify({ state: slim })}\n\n`));
-}
-
-function broadcast(data) {
-  // used for logs only
-  sseClients.forEach(c => c.write(`data: ${data}\n\n`));
+function broadcastState() {
+  // Send the **full** state (except the logs array) so the UI always has all dynamic fields
+  const { logs, ...rest } = state;
+  sseClients.forEach(c => c.write(`data: ${JSON.stringify({ state: rest })}\n\n`));
 }
 
 // ---------- Market definitions ----------
@@ -58,8 +44,8 @@ const state = {
   marketSymbol: 'R_100',
   dp: MARKETS['R_100'].dp,
   triggerMode: 'single',
-  triggerDigits: '',               // single mode list
-  clusterDigits: '',              // cluster digit list
+  triggerDigits: '',
+  clusterDigits: '',
   clusterSize: 2,
   lastDigitsBuffer: [],
   barrierDigit: '3',
@@ -80,7 +66,7 @@ const state = {
   logs: []
 };
 
-// ---------- SSE endpoint (sends only dynamic state + logs) ----------
+// ---------- SSE endpoint ----------
 app.get('/api/logs', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -89,12 +75,12 @@ app.get('/api/logs', (req, res) => {
   });
   res.write('\n');
   sseClients.add(res);
-  // Send full initial state once (all settings) then only slim updates
-  res.write(`data: ${JSON.stringify({ state: { ...state, logs: undefined } })}\n\n`);
+  // Send full current state when client connects
+  const { logs, ...rest } = state;
+  res.write(`data: ${JSON.stringify({ state: rest })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
 
-// Full state endpoint (used by UI on load)
 app.get('/api/state', (req, res) => {
   res.json({ ...state, logs: undefined });
 });
@@ -110,13 +96,13 @@ app.post('/api/control', (req, res) => {
     state.pendingContractId = null;
     state.lastDigitsBuffer = [];
     addLog('Trading started.');
-    broadcastFullState();
+    broadcastState();
     res.json({ success: true, state });
   }
   else if (action === 'stop') {
     state.active = false;
     addLog('Trading stopped.');
-    broadcastFullState();
+    broadcastState();
     res.json({ success: true, state });
   }
   else if (action === 'update') {
@@ -149,6 +135,7 @@ app.post('/api/control', (req, res) => {
     if (takeProfit !== undefined) state.takeProfit = parseFloat(takeProfit);
     if (stopLoss !== undefined) state.stopLoss = parseFloat(stopLoss);
 
+    broadcastState();
     res.json({ success: true, state });
   }
   else {
@@ -208,7 +195,7 @@ function handleDerivMessage(msg) {
   else if (msg.msg_type === 'balance') {
     state.balance = msg.balance.balance;
     state.currency = msg.balance.currency;
-    broadcastFullState();
+    broadcastState();
   }
   else if (msg.msg_type === 'tick') {
     if (msg.tick.symbol !== state.marketSymbol) return;
@@ -218,7 +205,7 @@ function handleDerivMessage(msg) {
     const formatted = parseFloat(rawPrice).toFixed(state.dp);
     state.formattedPrice = formatted;
     state.lastDigit = formatted.slice(-1);
-    broadcastFullState();
+    broadcastState(); // ✅ now sends full state → tick appears in UI
 
     if (!state.active || state.waitingForResult) return;
 
@@ -286,7 +273,7 @@ function handleDerivMessage(msg) {
 
       state.pendingContractId = null;
       state.waitingForResult = false;
-      broadcastFullState();
+      broadcastState();
 
       if (state.runningProfit >= state.takeProfit) {
         addLog(`Take Profit reached (${state.runningProfit.toFixed(2)}). Stopping.`);

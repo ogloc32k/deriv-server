@@ -124,9 +124,6 @@
 const logDiv = document.getElementById('logs');
 const es = new EventSource('/api/logs');
 
-// Keep a flag to avoid overwriting user settings during live updates
-let userInteracted = false;
-
 es.onmessage = e => {
   const data = JSON.parse(e.data);
   if (data.logs) {
@@ -139,9 +136,9 @@ es.onmessage = e => {
     });
   }
   if (data.state) {
-    // Only update dynamic values, never config fields unless it's the initial load
+    // Update dynamic fields only – NEVER config inputs
     const s = data.state;
-    if (s.balance) document.getElementById('balanceDisplay').textContent = `${parseFloat(s.balance).toFixed(2)} ${s.currency || 'USD'}`;
+    if (s.balance !== undefined) document.getElementById('balanceDisplay').textContent = `${parseFloat(s.balance).toFixed(2)} ${s.currency || 'USD'}`;
     if (s.active !== undefined) {
       const running = s.active;
       document.getElementById('serverStatus').textContent = running ? 'Running' : 'Stopped';
@@ -157,30 +154,28 @@ es.onmessage = e => {
     }
     if (s.formattedPrice) {
       document.getElementById('tickPrice').textContent = s.formattedPrice;
-      document.getElementById('lastDigit').textContent = s.lastDigit;
+      document.getElementById('lastDigit').textContent = s.lastDigit || '';
     }
-    // NEVER overwrite config inputs via SSE – they are set only on page load
   }
 };
 
-// Fetch full state only once to initialize config fields
+// Load config fields ONCE from /api/state
 fetch('/api/state')
   .then(r => r.json())
   .then(s => {
-    // Set config inputs
-    document.getElementById('marketSymbol').value = s.marketSymbol;
-    document.getElementById('triggerMode').value = s.triggerMode;
-    document.getElementById('triggerDigits').value = s.triggerDigits;
-    document.getElementById('clusterDigits').value = s.clusterDigits;
-    document.getElementById('clusterSize').value = s.clusterSize;
-    document.getElementById('directionOverUnder').value = s.directionOverUnder;
-    document.getElementById('barrierDigit').value = s.barrierDigit;
-    document.getElementById('stake').value = s.stake;
-    document.getElementById('martingale').value = s.martingale;
-    document.getElementById('takeProfit').value = s.takeProfit;
-    document.getElementById('stopLoss').value = s.stopLoss;
+    document.getElementById('marketSymbol').value = s.marketSymbol || 'R_100';
+    document.getElementById('triggerMode').value = s.triggerMode || 'single';
+    document.getElementById('triggerDigits').value = s.triggerDigits || '';
+    document.getElementById('clusterDigits').value = s.clusterDigits || '';
+    document.getElementById('clusterSize').value = s.clusterSize || 2;
+    document.getElementById('directionOverUnder').value = s.directionOverUnder || 'over';
+    document.getElementById('barrierDigit').value = s.barrierDigit || '3';
+    document.getElementById('stake').value = s.stake || 1;
+    document.getElementById('martingale').value = s.martingale || 2;
+    document.getElementById('takeProfit').value = s.takeProfit || 10;
+    document.getElementById('stopLoss').value = s.stopLoss || 10;
     toggleModeFields();
-    // Also update dynamic fields
+    // Also set initial dynamic values
     if (s.balance) document.getElementById('balanceDisplay').textContent = `${parseFloat(s.balance).toFixed(2)} ${s.currency || 'USD'}`;
     if (s.active !== undefined) {
       const running = s.active;
@@ -194,10 +189,6 @@ fetch('/api/state')
       const el = document.getElementById('profitDisplay');
       el.textContent = profit;
       el.className = profit >= 0 ? 'profit-positive' : 'profit-negative';
-    }
-    if (s.formattedPrice) {
-      document.getElementById('tickPrice').textContent = s.formattedPrice;
-      document.getElementById('lastDigit').textContent = s.lastDigit;
     }
   });
 
