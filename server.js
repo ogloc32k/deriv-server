@@ -37,11 +37,11 @@ const MARKETS = {
 // ---------- Trading State ----------
 const state = {
   active: false,
-  marketSymbol: 'R_100',          // current symbol
-  dp: MARKETS['R_100'].dp,       // decimal places for display/extraction
-  triggerDigits: '',              // e.g. "1,2,3" (empty = every tick)
-  barrierDigit: '3',             // digit for DIGITOVER/UNDER (0-9)
-  directionOverUnder: 'over',    // 'over' or 'under'
+  marketSymbol: 'R_100',
+  dp: MARKETS['R_100'].dp,
+  triggerDigits: '',
+  barrierDigit: '3',
+  directionOverUnder: 'over',
   stake: 1.0,
   martingale: 2.0,
   takeProfit: 10.0,
@@ -52,9 +52,9 @@ const state = {
   currentStake: 1.0,
   pendingContractId: null,
   waitingForResult: false,
-  latestTick: null,               // raw number
-  formattedPrice: '',            // price string after dp formatting
-  lastDigit: '',                 // last digit character
+  latestTick: null,
+  formattedPrice: '',
+  lastDigit: '',
   logs: []
 };
 
@@ -99,7 +99,7 @@ app.post('/api/control', (req, res) => {
     if (marketSymbol && MARKETS[marketSymbol]) {
       state.marketSymbol = marketSymbol;
       state.dp = MARKETS[marketSymbol].dp;
-      // resubscribe ticks for new market
+      // re‑subscribe ticks for the new market
       if (derivWs && derivWs.readyState === WebSocket.OPEN) {
         send({ ticks: state.marketSymbol, req_id: ++reqId });
       }
@@ -177,21 +177,22 @@ function handleDerivMessage(msg) {
     broadcast(JSON.stringify({ state }));
   }
   else if (msg.msg_type === 'tick') {
+    // ✅ Only process ticks for the currently selected market
+    if (msg.tick.symbol !== state.marketSymbol) return;
+
     const rawPrice = msg.tick.quote;
     state.latestTick = rawPrice;
-    // format according to dp
     const formatted = parseFloat(rawPrice).toFixed(state.dp);
     state.formattedPrice = formatted;
     state.lastDigit = formatted.slice(-1);
-    broadcast(JSON.stringify({ state }));  // send fresh tick info
+    broadcast(JSON.stringify({ state }));
 
     if (!state.active || state.waitingForResult) return;
 
-    // Decide whether to trade based on trigger digits
-    let tradeNow = false;
     const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
+    let tradeNow = false;
     if (triggerSet.length === 0) {
-      tradeNow = true;  // empty → trade on every tick
+      tradeNow = true;   // empty → every tick triggers a trade
     } else {
       if (triggerSet.includes(state.lastDigit)) tradeNow = true;
     }
@@ -253,9 +254,9 @@ function startTrade(currentPrice) {
     amount: state.currentStake,
     basis: 'stake',
     currency: state.currency,
-    duration: 1,             // 1 tick minimum for digit contracts
+    duration: 1,
     duration_unit: 't',
-    underlying_symbol: state.marketSymbol,
+    symbol: state.marketSymbol,          // ✅ FIXED: was underlying_symbol
     contract_type: contractType,
     barrier: barrier,
     req_id: ++reqId
