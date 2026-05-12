@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Deriv Trading Server</title>
+<style>
+  body { font-family: Arial; margin: 20px; background: #f4f4f4; }
+  .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; }
+  .control-row { margin: 10px 0; }
+  label { display: inline-block; width: 150px; }
+  input, select { padding: 5px; width: 180px; }
+  button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+  #logs { background: #222; color: #0f0; height: 300px; overflow-y: auto; padding: 10px; font-family: monospace; }
+  .log-entry { margin: 2px 0; }
+  .status { font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>Deriv Trading Control</h2>
+  <div class="status">Server: <span id="serverStatus">Stopped</span></div><br/>
+  <div class="control-row">
+    <label>Market Symbol:</label>
+    <select id="market">
+      <option value="R_100">R_100 (Volatility 100)</option>
+      <option value="R_75">R_75</option>
+      <option value="R_50">R_50</option>
+      <option value="R_25">R_25</option>
+      <option value="1HZ100V">Volatility 100 (1s)</option>
+    </select>
+  </div>
+  <div class="control-row">
+    <label>Trigger Digit (0-9):</label>
+    <input type="number" id="digit" min="0" max="9" value="5">
+  </div>
+  <div class="control-row">
+    <label>Direction:</label>
+    <select id="direction">
+      <option value="CALL">CALL (Higher)</option>
+      <option value="PUT">PUT (Lower)</option>
+    </select>
+  </div>
+  <div class="control-row">
+    <label>Barrier Offset:</label>
+    <input type="number" id="barrierOffset" step="0.01" value="1.0">
+  </div>
+  <div class="control-row">
+    <label>Duration (ticks):</label>
+    <input type="number" id="duration" value="1" min="1" max="10">
+  </div>
+  <div class="control-row">
+    <label>Stake:</label>
+    <input type="number" id="stake" step="0.01" value="1.00">
+  </div>
+  <div class="control-row">
+    <label>Martingale Mult.:</label>
+    <input type="number" id="martingale" step="0.1" value="2.0">
+  </div>
+  <div class="control-row">
+    <label>Take Profit:</label>
+    <input type="number" id="takeProfit" step="0.01" value="10.00">
+  </div>
+  <div class="control-row">
+    <label>Stop Loss:</label>
+    <input type="number" id="stopLoss" step="0.01" value="10.00">
+  </div>
+  <div>
+    <button onclick="startTrading()" id="startBtn">Start Trading</button>
+    <button onclick="stopTrading()" id="stopBtn" disabled>Stop Trading</button>
+  </div>
+
+  <h3>Trade Logs</h3>
+  <div id="logs"></div>
+</div>
+
+<script>
+let serverActive = false;
+
+function updateUI(state) {
+  serverActive = state.active;
+  document.getElementById('serverStatus').innerText = serverActive ? 'Running' : 'Stopped';
+  document.getElementById('startBtn').disabled = serverActive;
+  document.getElementById('stopBtn').disabled = !serverActive;
+  // Update input fields from state (optional)
+  if (state) {
+    document.getElementById('market').value = state.market || 'R_100';
+    document.getElementById('digit').value = state.digit || '5';
+    document.getElementById('direction').value = state.direction || 'CALL';
+    document.getElementById('barrierOffset').value = state.barrierOffset || 1.0;
+    document.getElementById('duration').value = state.duration || 1;
+    document.getElementById('stake').value = state.stake || 1.0;
+    document.getElementById('martingale').value = state.martingale || 1.0;
+    document.getElementById('takeProfit').value = state.takeProfit || 10;
+    document.getElementById('stopLoss').value = state.stopLoss || 10;
+  }
+}
+
+function startTrading() {
+  const payload = {
+    market: document.getElementById('market').value,
+    digit: document.getElementById('digit').value,
+    direction: document.getElementById('direction').value,
+    barrierOffset: parseFloat(document.getElementById('barrierOffset').value),
+    duration: parseInt(document.getElementById('duration').value),
+    stake: parseFloat(document.getElementById('stake').value),
+    martingale: parseFloat(document.getElementById('martingale').value),
+    takeProfit: parseFloat(document.getElementById('takeProfit').value),
+    stopLoss: parseFloat(document.getElementById('stopLoss').value)
+  };
+  // First update parameters
+  fetch('/api/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update', ...payload })
+  }).then(() => {
+    // Then start
+    return fetch('/api/control', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'start'}) });
+  }).then(r => r.json()).then(data => {
+    if(data.error) alert(data.error);
+    else updateUI(data.state);
+  });
+}
+
+function stopTrading() {
+  fetch('/api/control', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'}) })
+    .then(r => r.json()).then(data => {
+      if(data.error) alert(data.error);
+      else updateUI(data.state);
+    });
+}
+
+// SSE for logs
+const logDiv = document.getElementById('logs');
+const evtSource = new EventSource('/api/logs');
+evtSource.onmessage = function(event) {
+  const data = JSON.parse(event.data);
+  if(data.logs) {
+    data.logs.forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'log-entry';
+      div.textContent = `[${new Date(l.time).toLocaleTimeString()}] ${l.message}`;
+      logDiv.insertBefore(div, logDiv.firstChild);
+      // Keep max 200 entries in DOM
+      while (logDiv.children.length > 200) logDiv.removeChild(logDiv.lastChild);
+    });
+  }
+};
+
+// Fetch initial state
+fetch('/api/state').then(r => r.json()).then(state => updateUI(state));
+</script>
+</body>
+</html>
