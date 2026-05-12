@@ -25,6 +25,7 @@
   .status-stopped { color: #c62828; font-weight: bold; }
   .tick-box { font-size: 28px; background: #000; color: #0f0; padding: 5px 15px; border-radius: 6px; font-family: monospace; }
   .last-digit { font-size: 36px; font-weight: bold; margin-top: 5px; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
@@ -60,8 +61,31 @@
       </select>
     </div>
     <div class="col">
+      <label>Trigger Mode</label>
+      <select id="triggerMode">
+        <option value="single" selected>Single Digit</option>
+        <option value="cluster">Cluster Digits</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Single digit fields -->
+  <div id="singleDigitsBlock" class="row">
+    <div class="col">
       <label>Trigger Digits (comma separated, empty = all)</label>
       <input type="text" id="triggerDigits" placeholder="e.g. 1,2,3" value="5">
+    </div>
+  </div>
+
+  <!-- Cluster digit fields -->
+  <div id="clusterDigitsBlock" class="row hidden">
+    <div class="col">
+      <label>Cluster Digits (comma separated)</label>
+      <input type="text" id="clusterDigits" placeholder="e.g. 0,1,2,3" value="0,1,2,3">
+    </div>
+    <div class="col">
+      <label>Cluster Size (ticks)</label>
+      <input type="number" id="clusterSize" min="2" max="10" value="2">
     </div>
   </div>
 
@@ -134,14 +158,33 @@ function updateUI(s) {
     document.getElementById('tickPrice').textContent = s.formattedPrice;
     document.getElementById('lastDigit').textContent = s.lastDigit;
   }
+
+  // Sync UI fields with server state (only if not being edited)
+  if (s.triggerMode) {
+    document.getElementById('triggerMode').value = s.triggerMode;
+    toggleModeFields();
+  }
+  if (s.triggerDigits !== undefined) document.getElementById('triggerDigits').value = s.triggerDigits;
+  if (s.clusterDigits !== undefined) document.getElementById('clusterDigits').value = s.clusterDigits;
+  if (s.clusterSize !== undefined) document.getElementById('clusterSize').value = s.clusterSize;
 }
 
 fetch('/api/state').then(r => r.json()).then(updateUI);
 
+function toggleModeFields() {
+  const mode = document.getElementById('triggerMode').value;
+  document.getElementById('singleDigitsBlock').classList.toggle('hidden', mode !== 'single');
+  document.getElementById('clusterDigitsBlock').classList.toggle('hidden', mode !== 'cluster');
+}
+document.getElementById('triggerMode').addEventListener('change', toggleModeFields);
+
 function startTrading() {
   const payload = {
     marketSymbol: document.getElementById('marketSymbol').value,
+    triggerMode: document.getElementById('triggerMode').value,
     triggerDigits: document.getElementById('triggerDigits').value,
+    clusterDigits: document.getElementById('clusterDigits').value,
+    clusterSize: parseInt(document.getElementById('clusterSize').value),
     directionOverUnder: document.getElementById('directionOverUnder').value,
     barrierDigit: document.getElementById('barrierDigit').value,
     stake: parseFloat(document.getElementById('stake').value),
