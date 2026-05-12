@@ -7,47 +7,58 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-// Serve static files from public
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// -------------------- Trading State --------------------
-let tradingState = {
+// ---------- SSE ----------
+const sseClients = new Set();
+let logId = 1;
+
+function addLog(msg) {
+  const entry = { id: logId++, time: new Date().toISOString(), message: msg };
+  state.logs.unshift(entry);
+  if (state.logs.length > 200) state.logs.pop();
+  broadcast(JSON.stringify({ logs: [entry] }));
+}
+
+function broadcast(data) {
+  sseClients.forEach(c => c.write(`data: ${data}\n\n`));
+}
+
+// ---------- Market definitions ----------
+const MARKETS = {
+  "R_10":  { name: "V10",  dp: 3 },
+  "R_25":  { name: "V25",  dp: 3 },
+  "R_50":  { name: "V50",  dp: 4 },
+  "R_75":  { name: "V75",  dp: 4 },
+  "R_100": { name: "V100", dp: 2 }
+};
+
+// ---------- Trading State ----------
+const state = {
   active: false,
-  market: 'R_100',
-  digit: '5',
-  direction: 'CALL',
-  barrierOffset: 1.0,
-  duration: 1,
+  marketSymbol: 'R_100',          // current symbol
+  dp: MARKETS['R_100'].dp,       // decimal places for display/extraction
+  triggerDigits: '',              // e.g. "1,2,3" (empty = every tick)
+  barrierDigit: '3',             // digit for DIGITOVER/UNDER (0-9)
+  directionOverUnder: 'over',    // 'over' or 'under'
   stake: 1.0,
-  martingale: 1.0,
-  takeProfit: 10,
-  stopLoss: 10,
-  totalProfit: 0,
+  martingale: 2.0,
+  takeProfit: 10.0,
+  stopLoss: 10.0,
+  balance: null,
+  currency: 'USD',
+  runningProfit: 0,
   currentStake: 1.0,
   pendingContractId: null,
   waitingForResult: false,
-  logs: [],
-  tickCooldown: false
+  latestTick: null,               // raw number
+  formattedPrice: '',            // price string after dp formatting
+  lastDigit: '',                 // last digit character
+  logs: []
 };
 
-let derivWs = null;
-let logId = 1;
-
-// Helper to add log and send to all SSE clients
-const sseClients = new Set();
-
-function addLog(message) {
-  const entry = { id: logId++, time: new Date().toISOString(), message };
-  tradingState.logs.unshift(entry); // newest first
-  if (tradingState.logs.length > 200) tradingState.logs.pop();
-  // Notify SSE clients
-  sseClients.forEach(client => {
-    client.write(`data: ${JSON.stringify({ logs: [entry] })}\n\n`);
-  });
-}
-
-// SSE endpoint for logs
+// ---------- SSE endpoint ----------
 app.get('/api/logs', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -56,83 +67,97 @@ app.get('/api/logs', (req, res) => {
   });
   res.write('\n');
   sseClients.add(res);
+  res.write(`data: ${JSON.stringify({ state })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
 
-// Control endpoint: Start/Stop
+app.get('/api/state', (req, res) => {
+  res.json({ ...state, logs: undefined });
+});
+
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
+
   if (action === 'start') {
-    if (!process.env.DERIV_APP_ID || !process.env.DERIV_API_TOKEN) {
-      return res.status(400).json({ error: 'Missing Deriv credentials in environment.' });
-    }
-    tradingState.totalProfit = 0;
-    tradingState.currentStake = tradingState.stake;
-    tradingState.pendingContractId = null;
-    tradingState.waitingForResult = false;
-    tradingState.tickCooldown = false;
-    tradingState.active = true;
-    connectDeriv();
+    state.active = true;
+    state.runningProfit = 0;
+    state.currentStake = state.stake;
+    state.waitingForResult = false;
+    state.pendingContractId = null;
     addLog('Trading started.');
-    res.json({ success: true, state: tradingState });
-  } else if (action === 'stop') {
-    tradingState.active = false;
-    if (derivWs) derivWs.close();
+    res.json({ success: true, state });
+  }
+  else if (action === 'stop') {
+    state.active = false;
     addLog('Trading stopped.');
-    res.json({ success: true, state: tradingState });
-  } else if (action === 'update') {
-    // Update parameters
-    const { market, digit, direction, barrierOffset, duration, stake, martingale, takeProfit, stopLoss } = req.body;
-    if (market) tradingState.market = market;
-    if (digit !== undefined) tradingState.digit = String(digit);
-    if (direction) tradingState.direction = direction;
-    if (barrierOffset !== undefined) tradingState.barrierOffset = parseFloat(barrierOffset);
-    if (duration !== undefined) tradingState.duration = parseInt(duration);
-    if (stake !== undefined) { tradingState.stake = parseFloat(stake); if (!tradingState.active) tradingState.currentStake = parseFloat(stake); }
-    if (martingale !== undefined) tradingState.martingale = parseFloat(martingale);
-    if (takeProfit !== undefined) tradingState.takeProfit = parseFloat(takeProfit);
-    if (stopLoss !== undefined) tradingState.stopLoss = parseFloat(stopLoss);
-    res.json({ success: true, state: tradingState });
-  } else {
+    res.json({ success: true, state });
+  }
+  else if (action === 'update') {
+    const { marketSymbol, triggerDigits, barrierDigit, directionOverUnder,
+            stake, martingale, takeProfit, stopLoss } = req.body;
+
+    if (marketSymbol && MARKETS[marketSymbol]) {
+      state.marketSymbol = marketSymbol;
+      state.dp = MARKETS[marketSymbol].dp;
+      // resubscribe ticks for new market
+      if (derivWs && derivWs.readyState === WebSocket.OPEN) {
+        send({ ticks: state.marketSymbol, req_id: ++reqId });
+      }
+    }
+    if (triggerDigits !== undefined) state.triggerDigits = String(triggerDigits).replace(/\s/g, '');
+    if (barrierDigit !== undefined) state.barrierDigit = String(barrierDigit);
+    if (directionOverUnder) state.directionOverUnder = directionOverUnder;
+    if (stake !== undefined) {
+      state.stake = parseFloat(stake);
+      if (!state.active) state.currentStake = parseFloat(stake);
+    }
+    if (martingale !== undefined) state.martingale = parseFloat(martingale);
+    if (takeProfit !== undefined) state.takeProfit = parseFloat(takeProfit);
+    if (stopLoss !== undefined) state.stopLoss = parseFloat(stopLoss);
+
+    res.json({ success: true, state });
+  }
+  else {
     res.status(400).json({ error: 'Invalid action' });
   }
 });
 
-// Get current state
-app.get('/api/state', (req, res) => {
-  res.json({ ...tradingState, logs: undefined }); // logs are streamed
-});
+// ---------- Deriv WebSocket ----------
+let derivWs = null;
+let reqId = 0;
+let reconnectTimer = null;
 
-// -------------------- Deriv WebSocket Logic --------------------
+function send(msg) {
+  if (derivWs && derivWs.readyState === WebSocket.OPEN) {
+    derivWs.send(JSON.stringify(msg));
+  }
+}
+
 function connectDeriv() {
   if (derivWs) derivWs.close();
   const appId = process.env.DERIV_APP_ID;
   derivWs = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${appId}`);
 
   derivWs.on('open', () => {
-    addLog('Connected to Deriv API.');
-    // Authorize
-    derivWs.send(JSON.stringify({ authorize: process.env.DERIV_API_TOKEN }));
+    addLog('Connected to Deriv. Authorizing...');
+    send({ authorize: process.env.DERIV_API_TOKEN });
   });
 
-  derivWs.on('message', (data) => {
+  derivWs.on('message', data => {
     try {
-      const msg = JSON.parse(data);
-      handleDerivMessage(msg);
+      handleDerivMessage(JSON.parse(data));
     } catch (e) {
       console.error('Invalid Deriv message', data);
     }
   });
 
   derivWs.on('close', () => {
-    addLog('Deriv WebSocket closed.');
-    tradingState.active = false;
+    addLog('Deriv connection lost – reconnecting in 5s...');
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectDeriv, 5000);
   });
 
-  derivWs.on('error', (err) => {
-    addLog(`Deriv WebSocket error: ${err.message}`);
-    tradingState.active = false;
-  });
+  derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
 }
 
 function handleDerivMessage(msg) {
@@ -141,102 +166,103 @@ function handleDerivMessage(msg) {
     return;
   }
 
-  // After authorization, subscribe to ticks
   if (msg.msg_type === 'authorize') {
-    addLog('Authorized. Subscribing to market ticks...');
-    derivWs.send(JSON.stringify({ ticks: tradingState.market }));
+    addLog('Authorized. Subscribing to balance & ticks.');
+    send({ balance: 1, subscribe: 1, req_id: ++reqId });
+    send({ ticks: state.marketSymbol, req_id: ++reqId });
   }
+  else if (msg.msg_type === 'balance') {
+    state.balance = msg.balance.balance;
+    state.currency = msg.balance.currency;
+    broadcast(JSON.stringify({ state }));
+  }
+  else if (msg.msg_type === 'tick') {
+    const rawPrice = msg.tick.quote;
+    state.latestTick = rawPrice;
+    // format according to dp
+    const formatted = parseFloat(rawPrice).toFixed(state.dp);
+    state.formattedPrice = formatted;
+    state.lastDigit = formatted.slice(-1);
+    broadcast(JSON.stringify({ state }));  // send fresh tick info
 
-  // Tick stream
-  if (msg.msg_type === 'tick') {
-    if (!tradingState.active) return;
-    const price = msg.tick.quote;
-    const lastChar = price.toString().slice(-1);
-    if (lastChar === tradingState.digit && !tradingState.waitingForResult && !tradingState.tickCooldown) {
-      placeTrade(price);
+    if (!state.active || state.waitingForResult) return;
+
+    // Decide whether to trade based on trigger digits
+    let tradeNow = false;
+    const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
+    if (triggerSet.length === 0) {
+      tradeNow = true;  // empty → trade on every tick
+    } else {
+      if (triggerSet.includes(state.lastDigit)) tradeNow = true;
     }
+
+    if (tradeNow) startTrade(rawPrice);
   }
+  else if (msg.msg_type === 'proposal') {
+    const proposalId = msg.proposal.id;
+    const askPrice = msg.proposal.ask_price;
+    addLog(`Proposal received. Buying at ${askPrice}`);
+    send({ buy: proposalId, price: askPrice, req_id: ++reqId });
+  }
+  else if (msg.msg_type === 'buy') {
+    const contractId = msg.buy.contract_id;
+    state.pendingContractId = contractId;
+    addLog(`Contract ${contractId} opened.`);
+    send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: ++reqId });
+  }
+  else if (msg.msg_type === 'proposal_open_contract') {
+    const c = msg.proposal_open_contract;
+    if (c.is_sold && c.contract_id === state.pendingContractId) {
+      const profit = parseFloat(c.profit) || 0;
+      state.runningProfit += profit;
+      addLog(`Settled: ${profit >= 0 ? 'WIN' : 'LOSS'} | Profit: ${profit.toFixed(2)} | Total: ${state.runningProfit.toFixed(2)}`);
 
-  // Proposal open contract updates (after buying)
-  if (msg.msg_type === 'proposal_open_contract') {
-    const contract = msg.proposal_open_contract;
-    if (contract.is_sold && contract.contract_id === tradingState.pendingContractId) {
-      const profit = parseFloat(contract.profit);
-      tradingState.totalProfit += profit;
-      addLog(`Trade ${contract.contract_id} settled: ${profit >= 0 ? 'WIN' : 'LOSS'} | Profit: ${profit} | Total: ${tradingState.totalProfit.toFixed(2)}`);
-
-      // Martingale logic
       if (profit < 0) {
-        tradingState.currentStake *= tradingState.martingale;
-        tradingState.currentStake = Math.round(tradingState.currentStake * 100) / 100; // round
+        state.currentStake = Math.round(state.currentStake * state.martingale * 100) / 100;
       } else {
-        tradingState.currentStake = tradingState.stake;
+        state.currentStake = state.stake;
       }
 
-      tradingState.pendingContractId = null;
-      tradingState.waitingForResult = false;
+      state.pendingContractId = null;
+      state.waitingForResult = false;
+      broadcast(JSON.stringify({ state }));
 
-      // Check Take Profit / Stop Loss
-      if (tradingState.totalProfit >= tradingState.takeProfit) {
-        addLog(`Take Profit reached (${tradingState.totalProfit.toFixed(2)}). Stopping.`);
-        tradingState.active = false;
-        derivWs.close();
-      } else if (tradingState.totalProfit <= -tradingState.stopLoss) {
-        addLog(`Stop Loss hit (${tradingState.totalProfit.toFixed(2)}). Stopping.`);
-        tradingState.active = false;
-        derivWs.close();
+      if (state.runningProfit >= state.takeProfit) {
+        addLog(`Take Profit reached (${state.runningProfit.toFixed(2)}). Stopping.`);
+        state.active = false;
+      } else if (state.runningProfit <= -state.stopLoss) {
+        addLog(`Stop Loss hit (${state.runningProfit.toFixed(2)}). Stopping.`);
+        state.active = false;
       }
     }
   }
 }
 
-function placeTrade(currentPrice) {
-  if (!tradingState.active || tradingState.waitingForResult) return;
+function startTrade(currentPrice) {
+  if (!state.active || state.waitingForResult) return;
 
-  const barrier = parseFloat(currentPrice) + (tradingState.direction === 'CALL' ? tradingState.barrierOffset : -tradingState.barrierOffset);
-  const stake = tradingState.currentStake;
+  state.waitingForResult = true;
 
-  tradingState.waitingForResult = true;
-  tradingState.tickCooldown = true;
-  setTimeout(() => { tradingState.tickCooldown = false; }, 500); // avoid duplicate entries
+  const contractType = state.directionOverUnder === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
+  const barrier = parseInt(state.barrierDigit);
 
-  const buyParams = {
-    buy: 1,
-    price: Math.round(stake * 100) / 100,
-    parameters: {
-      contract_type: tradingState.direction,
-      symbol: tradingState.market,
-      duration: tradingState.duration,
-      duration_unit: 't',
-      barrier: Math.round(barrier * 100) / 100, // ensure 2 decimals
-      amount: stake,
-      basis: 'stake',
-      currency: 'USD'
-    }
-  };
+  addLog(`Placing ${contractType} barrier ${barrier} | trigger digit(s): ${state.triggerDigits || 'all'}`);
 
-  addLog(`Placing ${tradingState.direction} ${tradingState.market} barrier=${barrier.toFixed(2)} stake=${stake} at tick ${currentPrice}`);
-  derivWs.send(JSON.stringify(buyParams, null, 2));
-
-  // Listen for buy response to get contract_id
-  derivWs.once('message', (data) => {
-    try {
-      const resp = JSON.parse(data);
-      if (resp.msg_type === 'buy' && resp.buy) {
-        tradingState.pendingContractId = resp.buy.contract_id;
-        addLog(`Contract ${resp.buy.contract_id} opened.`);
-        // Subscribe to contract updates
-        derivWs.send(JSON.stringify({ proposal_open_contract: 1, contract_id: resp.buy.contract_id }));
-      } else if (resp.error) {
-        addLog(`Buy error: ${resp.error.message}`);
-        tradingState.waitingForResult = false;
-        tradingState.pendingContractId = null;
-      }
-    } catch (e) { }
+  send({
+    proposal: 1,
+    amount: state.currentStake,
+    basis: 'stake',
+    currency: state.currency,
+    duration: 1,             // 1 tick minimum for digit contracts
+    duration_unit: 't',
+    underlying_symbol: state.marketSymbol,
+    contract_type: contractType,
+    barrier: barrier,
+    req_id: ++reqId
   });
 }
 
-// Start server
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// ---------- Initial connection ----------
+connectDeriv();
+
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
