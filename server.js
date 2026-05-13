@@ -30,7 +30,7 @@ function sanitizeState() {
   return rest;
 }
 
-// ---------- Market definitions ----------
+// ---------- Markets ----------
 const MARKETS = {
   "R_10":  { name: "Volatility 10 Index",  dp: 3 },
   "R_25":  { name: "Volatility 25 Index",  dp: 3 },
@@ -39,119 +39,175 @@ const MARKETS = {
   "R_100": { name: "Volatility 100 Index", dp: 2 }
 };
 
-// ---------- Manual Trading State ----------
+// ---------- State ----------
 const state = {
   active: false,
   marketSymbol: 'R_100',
   dp: MARKETS['R_100'].dp,
-  triggerMode: 'single',
-  triggerDigits: '',
-  clusterDigits: '',
-  clusterSize: 2,
-  lastDigitsBuffer: [],
-  barrierDigit: '3',
-  directionOverUnder: 'over',
-  stake: 1.0,
-  martingale: 2.0,
-  takeProfit: 10.0,
-  stopLoss: 10.0,
   balance: null,
   currency: 'USD',
-  runningProfit: 0,
-  currentStake: 1.0,
+  // Settings
+  minConfidence: 45,          // 45% confidence threshold
+  maxOverBarrier: 4,
+  minUnderBarrier: 6,
+  dailyStopLossPct: 10,      // % of initial daily balance
+  dailyTakeProfitPct: 20,    // % of initial daily balance
+  riskPct: 2,                // risk per trade as % of balance
+  // Runtime
+  dailyStartBalance: null,
+  dailyPnl: 0,
+  locked: false,
+  waiting: false,
   pendingContractId: null,
-  waitingForResult: false,
-  latestTick: null,
-  formattedPrice: '',
-  lastDigit: '',
-  logs: [],
-  pendingTradeDetails: null,
-  balanceBeforeTrade: null,
-  settlementTimer: null,
-
-  // Virtual / real mode
-  tradingMode: 'virtual',        // 'virtual' | 'real'
-  virtualPattern: '',            // e.g. "LLW"
-  virtualPatternIndex: 0,
-  virtualPending: false,
-  virtualDirection: null,        // stored when virtual trade triggers
-  virtualBarrier: null,
-  winAction: 'back_to_virtual',  // 'back_to_virtual' | 'real_until_loss'
-  lossAction: 'back_to_virtual', // 'back_to_virtual' | 'real_until_win'
-  realSessionState: 'initial',   // 'initial' | 'exit_condition_set'
-  realExitCondition: null        // 'loss' | 'win'
+  balanceBefore: null,
+  timer: null,
+  signalConfidence: 0,
+  signalDirection: null,
+  signalBarrier: null,
+  logs: []
 };
 
-// ---------- SSE endpoint ----------
+// ---------- Analyzer (z‑score based) ----------
+class Analyzer {
+  constructor() {
+    this.ticks = [];
+    this.count = 0;
+    this.mean = new Array(10).fill(0);
+    this.m2 = new Array(10).fill(0);
+  }
+
+  feed(price, dp) {
+    const digit = parseInt(parseFloat(price).toFixed(dp).slice(-1));
+    this.ticks.push(digit);
+    if (this.ticks.length > 1000) this.ticks.shift();
+    if (this.ticks.length >= 100) {
+      const recent = this.ticks.slice(-100);
+      const freq = {};
+      for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
+      this.count++;
+      for (let d = 0; d < 10; d++) {
+        const delta = freq[d] - this.mean[d];
+        this.mean[d] += delta / this.count;
+        this.m2[d] += delta * (freq[d] - this.mean[d]);
+      }
+    }
+  }
+
+  getZ() {
+    if (this.count < 5) return null;
+    const recent = this.ticks.slice(-100);
+    const freq = {};
+    for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
+    const z = {};
+    for (let d = 0; d < 10; d++) {
+      const variance = this.m2[d] / (this.count - 1);
+      const std = Math.sqrt(variance) || 0.01;
+      z[d] = (freq[d] - this.mean[d]) / std;
+    }
+    return z;
+  }
+}
+
+const analyzer = new Analyzer();
+
+// ---------- Confidence ----------
+function computeConfidence(z) {
+  if (!z) return { over: 0, under: 0 };
+  let over = 0, under = 0;
+  if (z[0] < 0 && z[1] < 0) {
+    const rare = Math.min(3, Math.max(0, -Math.min(z[0], z[1]))) / 3;
+    over = (rare * 0.5 + 0.5) * 100;
+  }
+  if (z[8] < 0 && z[9] < 0) {
+    const rare = Math.min(3, Math.max(0, -Math.min(z[8], z[9]))) / 3;
+    under = (rare * 0.5 + 0.5) * 100;
+  }
+  return { over, under };
+}
+
+function selectBarrier(direction) {
+  const freq = {};
+  const recent = analyzer.ticks.slice(-100);
+  for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
+
+  let bestBarrier = null, bestProfit = -Infinity;
+  if (direction === 'over') {
+    for (let n = 0; n <= state.maxOverBarrier; n++) {
+      let win = 0;
+      for (let d = n + 1; d <= 9; d++) win += freq[d];
+      const profit = win * (10 / (9 - n)) * 0.98 - 1;
+      if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
+    }
+  } else {
+    for (let n = state.minUnderBarrier; n <= 9; n++) {
+      let win = 0;
+      for (let d = 0; d < n; d++) win += freq[d];
+      const profit = win * (10 / n) * 0.98 - 1;
+      if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
+    }
+  }
+  return bestBarrier;
+}
+
+// ---------- Risk management ----------
+function dailyLimitReached() {
+  if (!state.dailyStartBalance) return false;
+  const pnlPct = (state.dailyPnl / state.dailyStartBalance) * 100;
+  if (pnlPct <= -state.dailyStopLossPct) {
+    addLog(`Daily stop loss reached (${pnlPct.toFixed(1)}%). Locked for the day.`);
+    return true;
+  }
+  if (pnlPct >= state.dailyTakeProfitPct) {
+    addLog(`Daily profit target reached (${pnlPct.toFixed(1)}%). Locked for the day.`);
+    return true;
+  }
+  return false;
+}
+
+function calcStake() {
+  const stake = (state.riskPct / 100) * state.balance;
+  return Math.max(0.35, Math.round(stake * 100) / 100);
+}
+
+// ---------- SSE ----------
 app.get('/api/logs', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive'
-  });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.write('\n');
   sseClients.add(res);
   res.write(`data: ${JSON.stringify({ state: sanitizeState() })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
 
-app.get('/api/state', (req, res) => {
-  res.json({ ...state, logs: undefined });
-});
+app.get('/api/state', (req, res) => res.json({ ...state, logs: undefined }));
 
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
     state.active = true;
-    state.runningProfit = 0;
-    state.currentStake = Math.max(state.stake, 0.35);
-    state.waitingForResult = false;
-    state.pendingContractId = null;
-    state.lastDigitsBuffer = [];
-    state.virtualPending = false;
-    state.virtualPatternIndex = 0;
-    // start in virtual mode if pattern is set, else real
-    state.tradingMode = (state.virtualPattern && state.virtualPattern.length > 0) ? 'virtual' : 'real';
-    state.realSessionState = 'initial';
-    state.realExitCondition = null;
-    addLog('Manual trading started.');
+    state.locked = false;
+    state.dailyStartBalance = state.balance;
+    state.dailyPnl = 0;
+    state.waiting = false;
+    addLog('Trading started.');
   } else if (action === 'stop') {
     state.active = false;
-    if (state.settlementTimer) clearTimeout(state.settlementTimer);
-    state.virtualPending = false;
-    addLog('Manual trading stopped.');
+    if (state.timer) clearTimeout(state.timer);
+    addLog('Trading stopped.');
   } else if (action === 'update') {
-    const {
-      marketSymbol, triggerMode, triggerDigits,
-      clusterDigits, clusterSize,
-      barrierDigit, directionOverUnder,
-      stake, martingale, takeProfit, stopLoss,
-      virtualPattern, winAction, lossAction
-    } = req.body;
+    const { marketSymbol, minConfidence, dailyStopLossPct, dailyTakeProfitPct, riskPct, maxOverBarrier, minUnderBarrier } = req.body;
     if (marketSymbol && MARKETS[marketSymbol]) {
       state.marketSymbol = marketSymbol;
       state.dp = MARKETS[marketSymbol].dp;
-      state.lastDigitsBuffer = [];
       if (derivWs && derivWs.readyState === WebSocket.OPEN) {
         send({ ticks: state.marketSymbol, req_id: ++reqId });
       }
     }
-    if (triggerMode) state.triggerMode = triggerMode;
-    if (triggerDigits !== undefined) state.triggerDigits = String(triggerDigits).replace(/\s/g, '');
-    if (clusterDigits !== undefined) state.clusterDigits = String(clusterDigits).replace(/\s/g, '');
-    if (clusterSize !== undefined) state.clusterSize = parseInt(clusterSize) || 2;
-    if (barrierDigit !== undefined) state.barrierDigit = String(barrierDigit);
-    if (directionOverUnder) state.directionOverUnder = directionOverUnder;
-    if (stake !== undefined) {
-      state.stake = Math.max(parseFloat(stake), 0.35);
-      if (!state.active) state.currentStake = state.stake;
-    }
-    if (martingale !== undefined) state.martingale = parseFloat(martingale);
-    if (takeProfit !== undefined) state.takeProfit = parseFloat(takeProfit);
-    if (stopLoss !== undefined) state.stopLoss = parseFloat(stopLoss);
-    if (virtualPattern !== undefined) state.virtualPattern = String(virtualPattern).toUpperCase().replace(/[^LW]/g, '');
-    if (winAction) state.winAction = winAction;
-    if (lossAction) state.lossAction = lossAction;
+    if (minConfidence) state.minConfidence = parseInt(minConfidence);
+    if (dailyStopLossPct) state.dailyStopLossPct = parseFloat(dailyStopLossPct);
+    if (dailyTakeProfitPct) state.dailyTakeProfitPct = parseFloat(dailyTakeProfitPct);
+    if (riskPct) state.riskPct = parseFloat(riskPct);
+    if (maxOverBarrier !== undefined) state.maxOverBarrier = parseInt(maxOverBarrier);
+    if (minUnderBarrier !== undefined) state.minUnderBarrier = parseInt(minUnderBarrier);
   }
   broadcastSSE({ state: sanitizeState() });
   res.json({ success: true });
@@ -160,306 +216,93 @@ app.post('/api/control', (req, res) => {
 // ---------- Deriv WebSocket ----------
 let derivWs = null;
 let reqId = 0;
-let reconnectTimer = null;
 
-function send(msg) {
-  if (derivWs && derivWs.readyState === WebSocket.OPEN) {
-    derivWs.send(JSON.stringify(msg));
-  }
-}
+function send(msg) { if (derivWs && derivWs.readyState === WebSocket.OPEN) derivWs.send(JSON.stringify(msg)); }
 
 function connectDeriv() {
   if (derivWs) derivWs.close();
   const appId = process.env.DERIV_APP_ID;
   derivWs = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${appId}`);
-
   derivWs.on('open', () => {
-    addLog('Connected to Deriv. Authorizing...');
+    addLog('Connected. Authorizing...');
     send({ authorize: process.env.DERIV_API_TOKEN });
   });
-
   derivWs.on('message', data => {
-    try {
-      handleDerivMessage(JSON.parse(data));
-    } catch (e) {
-      console.error('Invalid Deriv message', data);
-    }
+    try { handleMessage(JSON.parse(data)); } catch (e) { console.error('Invalid message'); }
   });
-
-  derivWs.on('close', () => {
-    addLog('Deriv connection lost – reconnecting in 5s...');
-    clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectDeriv, 5000);
-  });
-
+  derivWs.on('close', () => setTimeout(connectDeriv, 5000));
   derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
 }
 
-function handleDerivMessage(msg) {
-  if (msg.error) {
-    addLog(`Deriv error: ${msg.error.code} - ${msg.error.message}`);
-    return;
-  }
-
+function handleMessage(msg) {
+  if (msg.error) return addLog(`Deriv error: ${msg.error.message}`);
   if (msg.msg_type === 'authorize') {
-    addLog('Authorized. Subscribing to balance & ticks.');
+    addLog('Authorized. Subscribing...');
     send({ balance: 1, subscribe: 1, req_id: ++reqId });
     send({ ticks: state.marketSymbol, req_id: ++reqId });
-  }
-  else if (msg.msg_type === 'balance') {
+  } else if (msg.msg_type === 'balance') {
     state.balance = msg.balance.balance;
     state.currency = msg.balance.currency;
     broadcastSSE({ state: sanitizeState() });
-  }
-  else if (msg.msg_type === 'tick') {
-    const symbol = msg.tick.symbol;
+  } else if (msg.msg_type === 'tick') {
     const price = msg.tick.quote;
-
-    if (state.active && symbol === state.marketSymbol) {
-      state.latestTick = price;
-      const formatted = parseFloat(price).toFixed(state.dp);
-      state.formattedPrice = formatted;
-      state.lastDigit = formatted.slice(-1);
-
-      // 1. Handle pending virtual outcome
-      if (state.virtualPending) {
-        resolveVirtualTrade(formatted);
-        broadcastSSE({ state: sanitizeState() });
-        return; // don't process triggers on outcome tick
-      }
-
-      // 2. No real trade pending → check triggers
-      if (!state.waitingForResult) {
-        state.lastDigitsBuffer.push(state.lastDigit);
-        if (state.lastDigitsBuffer.length > state.clusterSize) state.lastDigitsBuffer.shift();
-
-        let tradeNow = false;
-        if (state.triggerMode === 'single') {
-          const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-          if (triggerSet.length === 0 || triggerSet.includes(state.lastDigit)) tradeNow = true;
-        } else if (state.triggerMode === 'cluster') {
-          if (state.lastDigitsBuffer.length === state.clusterSize) {
-            const clusterSet = state.clusterDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-            if (clusterSet.length === 0 || state.lastDigitsBuffer.every(d => clusterSet.includes(d))) tradeNow = true;
-          }
-        }
-
-        if (tradeNow) {
-          if (state.tradingMode === 'virtual') {
-            startVirtualTrade();
-          } else {
-            startRealTrade();
-          }
-        }
+    if (msg.tick.symbol !== state.marketSymbol) return;
+    analyzer.feed(price, state.dp);
+    const z = analyzer.getZ();
+    if (z) {
+      const conf = computeConfidence(z);
+      state.signalConfidence = Math.max(conf.over, conf.under);
+      if (conf.over > conf.under && conf.over >= state.minConfidence) {
+        state.signalDirection = 'over';
+        state.signalBarrier = selectBarrier('over');
+      } else if (conf.under > conf.over && conf.under >= state.minConfidence) {
+        state.signalDirection = 'under';
+        state.signalBarrier = selectBarrier('under');
+      } else {
+        state.signalDirection = null;
+        state.signalBarrier = null;
       }
     }
+
     broadcastSSE({ state: sanitizeState() });
-  }
-  else if (msg.msg_type === 'proposal') {
-    const proposalId = msg.proposal.id;
-    const askPrice = msg.proposal.ask_price;
-    send({ buy: proposalId, price: askPrice, req_id: ++reqId });
-  }
-  else if (msg.msg_type === 'buy') {
-    const contractId = msg.buy.contract_id;
-    state.pendingContractId = contractId;
 
-    // Log "Bought" line
-    if (state.pendingTradeDetails) {
-      const d = state.pendingTradeDetails;
-      const directionWord = d.direction === 'over' ? 'higher' : 'lower';
-      addLog(`Bought: Win payout if the last digit of ${d.marketName} is strictly ${directionWord} than ${d.barrier} after ${d.duration} ticks. (ID: ${contractId})`);
-    }
+    // Trading logic
+    if (!state.active || state.waiting || state.locked || !state.signalDirection) return;
+    if (dailyLimitReached()) { state.locked = true; return; }
 
-    // 15-second balance-based settlement
-    if (state.settlementTimer) clearTimeout(state.settlementTimer);
-    state.settlementTimer = setTimeout(() => {
-      settleRealTrade(contractId);
-    }, 15000);
-  }
-  // Ignore proposal_open_contract
-}
-
-// ---------- Virtual trade logic ----------
-function startVirtualTrade() {
-  state.virtualPending = true;
-  state.virtualDirection = state.directionOverUnder;
-  state.virtualBarrier = parseInt(state.barrierDigit);
-  // Don't log a trigger; we'll log after outcome
-}
-
-function resolveVirtualTrade(formattedPrice) {
-  const lastDigit = parseInt(formattedPrice.slice(-1));
-  const barrier = state.virtualBarrier;
-  const direction = state.virtualDirection;
-
-  let outcome = 'L';  // loss by default
-  if (direction === 'over') {
-    if (lastDigit > barrier) outcome = 'W';
-  } else { // under
-    if (lastDigit < barrier) outcome = 'W';
-  }
-
-  addLog(`[VIRTUAL] Trade – last digit ${lastDigit} → ${outcome}`);
-
-  // Pattern matching
-  const pattern = state.virtualPattern;
-  if (!pattern || pattern.length === 0) {
-    // No pattern set → remain virtual forever (or treat as never switch?)
-    state.virtualPending = false;
-    return;
-  }
-
-  const expected = pattern[state.virtualPatternIndex];
-  if (outcome === expected) {
-    state.virtualPatternIndex++;
-    addLog(`[VIRTUAL] Pattern progress: ${pattern.slice(0, state.virtualPatternIndex)}/${pattern}`);
-    if (state.virtualPatternIndex === pattern.length) {
-      addLog(`[VIRTUAL] Pattern completed → switching to REAL trading`);
-      state.tradingMode = 'real';
-      state.virtualPatternIndex = 0;
-      state.realSessionState = 'initial';
-      state.realExitCondition = null;
-    }
-  } else {
-    addLog(`[VIRTUAL] Pattern broken (expected ${expected}, got ${outcome}). Resetting pattern.`);
-    state.virtualPatternIndex = 0;
-  }
-  state.virtualPending = false;
-}
-
-// ---------- Real trade logic ----------
-function startRealTrade() {
-  state.waitingForResult = true;
-  const contractType = state.directionOverUnder === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
-  const barrier = parseInt(state.barrierDigit);
-  const stakeToUse = Math.max(state.currentStake, 0.35);
-
-  state.balanceBeforeTrade = state.balance;
-  state.pendingTradeDetails = {
-    market: state.marketSymbol,
-    marketName: MARKETS[state.marketSymbol].name,
-    direction: state.directionOverUnder,
-    barrier: barrier,
-    duration: 1,
-    stake: stakeToUse
-  };
-
-  send({
-    proposal: 1,
-    amount: stakeToUse,
-    basis: 'stake',
-    currency: state.currency || 'USD',
-    duration: 1,
-    duration_unit: 't',
-    symbol: state.marketSymbol,
-    contract_type: contractType,
-    barrier: barrier,
-    req_id: ++reqId
-  });
-}
-
-function settleRealTrade(contractId) {
-  if (!state.waitingForResult || state.pendingContractId !== contractId) return;
-
-  const newBalance = state.balance;
-  const oldBalance = state.balanceBeforeTrade;
-  if (oldBalance === null || newBalance === null) {
-    addLog('Error: Could not determine settlement (balance missing)');
-    resetRealTrade();
-    return;
-  }
-
-  const difference = newBalance - oldBalance;
-  const now = new Date();
-  const dateStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' GMT';
-  addLog(dateStr);
-
-  if (difference > 0) {
-    state.runningProfit += difference;
-    addLog(`Profit amount: ${difference.toFixed(2)} USD`);
-  } else if (difference < 0) {
-    state.runningProfit += difference;
-    addLog(`Loss amount: ${difference.toFixed(2)} USD`);
-  } else {
-    addLog(`Draw: 0.00 USD`);
-  }
-
-  addLog(`Current P&L: ${state.runningProfit.toFixed(2)} USD | TP: ${state.takeProfit.toFixed(2)} | SL: -${state.stopLoss.toFixed(2)}`);
-
-  // Martingale
-  if (difference < 0) {
-    state.currentStake = Math.round(state.currentStake * state.martingale * 100) / 100;
-    state.currentStake = Math.max(state.currentStake, 0.35);
-  } else {
-    state.currentStake = state.stake;
-  }
-
-  // Post-real trade actions
-  const outcome = difference > 0 ? 'win' : (difference < 0 ? 'loss' : 'draw');
-  handleRealPostAction(outcome);
-
-  // TP/SL check
-  if (state.runningProfit >= state.takeProfit) {
-    addLog('Take profit reached. Stopping.');
-    state.active = false;
-  } else if (state.runningProfit <= -state.stopLoss) {
-    addLog('Stop loss hit. Stopping.');
-    state.active = false;
-  }
-
-  resetRealTrade();
-}
-
-function handleRealPostAction(outcome) {
-  if (state.realSessionState === 'initial') {
-    // First real trade after virtual pattern completion
-    if (outcome === 'win') {
-      if (state.winAction === 'back_to_virtual') {
-        addLog('Real win → back to virtual');
-        state.tradingMode = 'virtual';
-        state.virtualPatternIndex = 0;
-      } else if (state.winAction === 'real_until_loss') {
-        addLog('Real win → continue real until a loss');
-        state.realExitCondition = 'loss';
-        state.realSessionState = 'exit_condition_set';
-      }
-    } else if (outcome === 'loss') {
-      if (state.lossAction === 'back_to_virtual') {
-        addLog('Real loss → back to virtual');
-        state.tradingMode = 'virtual';
-        state.virtualPatternIndex = 0;
-      } else if (state.lossAction === 'real_until_win') {
-        addLog('Real loss → continue real until a win');
-        state.realExitCondition = 'win';
-        state.realSessionState = 'exit_condition_set';
-      }
-    }
-    // draws keep real mode without exit condition? Treat as no-op, stay real 'initial' maybe.
-  } else if (state.realSessionState === 'exit_condition_set') {
-    if (outcome === state.realExitCondition) {
-      addLog(`Exit condition (${state.realExitCondition}) met → back to virtual`);
-      state.tradingMode = 'virtual';
-      state.virtualPatternIndex = 0;
-      state.realSessionState = 'initial';
-      state.realExitCondition = null;
-    } else {
-      // stay real, condition unchanged
-    }
+    state.waiting = true;
+    const stake = calcStake();
+    const contractType = state.signalDirection === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
+    const barrier = state.signalBarrier;
+    state.balanceBefore = state.balance;
+    addLog(`Signal ${state.signalConfidence}% – Placing ${contractType} barrier ${barrier}, stake ${stake.toFixed(2)}`);
+    send({ proposal: 1, amount: stake, basis: 'stake', currency: state.currency, duration: 1, duration_unit: 't', symbol: state.marketSymbol, contract_type: contractType, barrier: barrier, req_id: ++reqId });
+  } else if (msg.msg_type === 'proposal') {
+    send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
+  } else if (msg.msg_type === 'buy') {
+    state.pendingContractId = msg.buy.contract_id;
+    addLog(`Bought: Win payout if the last digit of ${MARKETS[state.marketSymbol].name} is strictly ${state.signalDirection === 'over' ? 'higher' : 'lower'} than ${state.signalBarrier} after 1 ticks. (ID: ${msg.buy.contract_id})`);
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => settleTrade(), 15000);
   }
 }
 
-function resetRealTrade() {
+function settleTrade() {
+  if (!state.waiting) return;
+  const diff = state.balance - state.balanceBefore;
+  state.dailyPnl += diff;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' GMT';
+  addLog(now);
+  if (diff > 0) addLog(`Profit: +${diff.toFixed(2)} USD`);
+  else if (diff < 0) addLog(`Loss: ${diff.toFixed(2)} USD`);
+  else addLog('Draw');
+  addLog(`Daily P&L: ${state.dailyPnl.toFixed(2)} USD (${((state.dailyPnl/state.dailyStartBalance)*100).toFixed(1)}%)`);
+  state.waiting = false;
   state.pendingContractId = null;
-  state.waitingForResult = false;
-  state.pendingTradeDetails = null;
-  state.balanceBeforeTrade = null;
-  if (state.settlementTimer) clearTimeout(state.settlementTimer);
-  state.settlementTimer = null;
+  state.balanceBefore = null;
+  if (dailyLimitReached()) state.locked = true;
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- Initial connection ----------
 connectDeriv();
-
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
