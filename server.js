@@ -30,7 +30,7 @@ function sanitizeState() {
   return rest;
 }
 
-// ---------- Market definitions (with display names) ----------
+// ---------- Market definitions ----------
 const MARKETS = {
   "R_10":  { name: "Volatility 10 Index",  dp: 3 },
   "R_25":  { name: "Volatility 25 Index",  dp: 3 },
@@ -65,8 +65,9 @@ const state = {
   formattedPrice: '',
   lastDigit: '',
   logs: [],
-  // store details for the pending trade to build the "Bought" log
-  pendingTradeDetails: null
+  pendingTradeDetails: null,
+  balanceBeforeTrade: null,   // recorded just before placing buy
+  settlementTimer: null
 };
 
 // ---------- SSE endpoint ----------
@@ -98,6 +99,7 @@ app.post('/api/control', (req, res) => {
     addLog('Manual trading started.');
   } else if (action === 'stop') {
     state.active = false;
+    if (state.settlementTimer) clearTimeout(state.settlementTimer);
     addLog('Manual trading stopped.');
   } else if (action === 'update') {
     const {
@@ -196,8 +198,6 @@ function handleDerivMessage(msg) {
       state.formattedPrice = formatted;
       state.lastDigit = formatted.slice(-1);
 
-      // No extra log for outcome tick now – we’ll log the settlement directly
-
       if (!state.waitingForResult) {
         state.lastDigitsBuffer.push(state.lastDigit);
         if (state.lastDigitsBuffer.length > state.clusterSize) state.lastDigitsBuffer.shift();
@@ -225,7 +225,9 @@ function handleDerivMessage(msg) {
           const barrier = parseInt(state.barrierDigit);
           const stakeToUse = Math.max(state.currentStake, 0.35);
 
-          // Save details for the "Bought" log
+          // 📌 Save balance BEFORE trade
+          state.balanceBeforeTrade = state.balance;
+
           state.pendingTradeDetails = {
             market: state.marketSymbol,
             marketName: MARKETS[state.marketSymbol].name,
@@ -255,14 +257,13 @@ function handleDerivMessage(msg) {
   else if (msg.msg_type === 'proposal') {
     const proposalId = msg.proposal.id;
     const askPrice = msg.proposal.ask_price;
-    // Buy immediately – no extra log
     send({ buy: proposalId, price: askPrice, req_id: ++reqId });
   }
   else if (msg.msg_type === 'buy') {
     const contractId = msg.buy.contract_id;
     state.pendingContractId = contractId;
 
-    // Build and log the "Bought" line
+    // Log the "Bought" line
     if (state.pendingTradeDetails) {
       const d = state.pendingTradeDetails;
       const directionWord = d.direction === 'over' ? 'higher' : 'lower';
@@ -270,49 +271,76 @@ function handleDerivMessage(msg) {
       addLog(boughtLine);
     }
 
-    send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: ++reqId });
+    // ⏳ Wait 15 seconds, then check balance
+    if (state.settlementTimer) clearTimeout(state.settlementTimer);
+    state.settlementTimer = setTimeout(() => {
+      settleTrade(contractId);
+    }, 15000);  // 15 seconds
   }
-  else if (msg.msg_type === 'proposal_open_contract') {
-    const c = msg.proposal_open_contract;
-    if (state.active && state.waitingForResult && c.contract_id === state.pendingContractId) {
-      const netProfit = typeof c.profit === 'number' ? c.profit : parseFloat(c.profit) || 0;
-      state.runningProfit += netProfit;
+  // proposal_open_contract messages are ignored now
+}
 
-      // Timestamp for settlement
-      const now = new Date();
-      const dateStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' GMT';
-      addLog(dateStr);
+function settleTrade(contractId) {
+  if (!state.waitingForResult || state.pendingContractId !== contractId) return;
 
-      if (netProfit > 0) {
-        addLog(`Profit amount: ${netProfit.toFixed(2)} USD`);
-      } else if (netProfit < 0) {
-        addLog(`Loss amount: ${netProfit.toFixed(2)} USD`);
-      } else {
-        addLog(`Draw: 0.00 USD`);
-      }
+  // Use the latest balance (which is continuously updated)
+  const newBalance = state.balance;
+  const oldBalance = state.balanceBeforeTrade;
 
-      // Martingale
-      if (netProfit < 0) {
-        state.currentStake = Math.round(state.currentStake * state.martingale * 100) / 100;
-        state.currentStake = Math.max(state.currentStake, 0.35);
-      } else {
-        state.currentStake = state.stake;
-      }
-
-      state.pendingContractId = null;
-      state.waitingForResult = false;
-      state.pendingTradeDetails = null;
-
-      if (state.runningProfit >= state.takeProfit) {
-        addLog('Take profit reached. Stopping.');
-        state.active = false;
-      } else if (state.runningProfit <= -state.stopLoss) {
-        addLog('Stop loss hit. Stopping.');
-        state.active = false;
-      }
-    }
-    broadcastSSE({ state: sanitizeState() });
+  if (oldBalance === null || newBalance === null) {
+    addLog('Error: Could not determine settlement (balance missing)');
+    resetAfterTrade();
+    return;
   }
+
+  const difference = newBalance - oldBalance;
+
+  // Timestamp
+  const now = new Date();
+  const dateStr = now.toISOString().replace('T', ' ').slice(0, 19) + ' GMT';
+  addLog(dateStr);
+
+  if (difference > 0) {
+    state.runningProfit += difference;
+    addLog(`Profit amount: ${difference.toFixed(2)} USD`);
+  } else if (difference < 0) {
+    state.runningProfit += difference;  // difference is negative
+    addLog(`Loss amount: ${difference.toFixed(2)} USD`);
+  } else {
+    addLog(`Draw: 0.00 USD`);
+  }
+
+  // Show current P&L and thresholds
+  addLog(`Current P&L: ${state.runningProfit.toFixed(2)} USD | TP: ${state.takeProfit.toFixed(2)} | SL: -${state.stopLoss.toFixed(2)}`);
+
+  // Martingale
+  if (difference < 0) {
+    state.currentStake = Math.round(state.currentStake * state.martingale * 100) / 100;
+    state.currentStake = Math.max(state.currentStake, 0.35);
+  } else {
+    state.currentStake = state.stake;
+  }
+
+  // Check TP/SL
+  if (state.runningProfit >= state.takeProfit) {
+    addLog('Take profit reached. Stopping.');
+    state.active = false;
+  } else if (state.runningProfit <= -state.stopLoss) {
+    addLog('Stop loss hit. Stopping.');
+    state.active = false;
+  }
+
+  resetAfterTrade();
+}
+
+function resetAfterTrade() {
+  state.pendingContractId = null;
+  state.waitingForResult = false;
+  state.pendingTradeDetails = null;
+  state.balanceBeforeTrade = null;
+  if (state.settlementTimer) clearTimeout(state.settlementTimer);
+  state.settlementTimer = null;
+  broadcastSSE({ state: sanitizeState() });
 }
 
 // ---------- Initial connection ----------
