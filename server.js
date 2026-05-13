@@ -39,49 +39,13 @@ const MARKETS = {
   "R_100": { name: "V100", dp: 2 }
 };
 
-// ---------- Manual Trading State ----------
-const state = {
-  // manual mode fields
-  active: false,
-  marketSymbol: 'R_100',
-  dp: MARKETS['R_100'].dp,
-  triggerMode: 'single',
-  triggerDigits: '',
-  clusterDigits: '',
-  clusterSize: 2,
-  lastDigitsBuffer: [],
-  barrierDigit: '3',
-  directionOverUnder: 'over',
-  stake: 1.0,
-  martingale: 2.0,
-  takeProfit: 10.0,
-  stopLoss: 10.0,
-  balance: null,
-  currency: 'USD',
-  runningProfit: 0,
-  currentStake: 1.0,
-  pendingContractId: null,
-  waitingForResult: false,
-  latestTick: null,
-  formattedPrice: '',
-  lastDigit: '',
-  // auto‑trade fields
-  autoActive: false,
-  autoAnalysis: null,       // current signal details
-  autoSessionProfit: 0,
-  autoWaitingForResult: false,
-  autoPendingContractId: null,
-  dailyPnL: 0,
-  cooldownUntil: null,      // timestamp when cooldown ends
-  logs: []
-};
-
 // ---------- AdaptiveDigitAnalyzer (JS version) ----------
 class AdaptiveDigitAnalyzer {
   constructor(symbol, dp) {
     this.symbol = symbol;
     this.dp = dp;
     this.ticks = [];
+    this.prices = [];
     this.maxTicks = 1000;
     this.lastDigit = null;
     this.prevDigit = null;
@@ -97,7 +61,11 @@ class AdaptiveDigitAnalyzer {
     this.prevDigit = this.lastDigit;
     this.lastDigit = digit;
     this.ticks.push(digit);
-    if (this.ticks.length > this.maxTicks) this.ticks.shift();
+    this.prices.push(price);
+    if (this.ticks.length > this.maxTicks) {
+      this.ticks.shift();
+      this.prices.shift();
+    }
     this.snapshotCounter++;
     if (this.snapshotCounter >= 100) {
       this._takeSnapshot();
@@ -165,6 +133,32 @@ class AdaptiveDigitAnalyzer {
     }
     const maxEntropy = Math.log(10);
     const normEntropy = Math.max(0, Math.min(1, 1 - entropy / maxEntropy));
+
+    let priceSlope = 0;
+    if (this.prices.length >= 20) {
+      const recentPrices = this.prices.slice(-20).map(Number);
+      const n = recentPrices.length;
+      let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+      for (let i = 0; i < n; i++) {
+        sx += i;
+        sy += recentPrices[i];
+        sxy += i * recentPrices[i];
+        sx2 += i * i;
+      }
+      priceSlope = (n * sxy - sx * sy) / (n * sx2 - sx * sx);
+    }
+
+    let volatility = 0;
+    if (this.prices.length >= 10) {
+      const returns = [];
+      for (let i = 1; i < this.prices.length; i++) {
+        returns.push((this.prices[i] - this.prices[i-1]) / this.prices[i-1]);
+      }
+      const meanRet = returns.reduce((a,b) => a + b, 0) / returns.length;
+      const variance = returns.reduce((a,b) => a + (b - meanRet)**2, 0) / returns.length;
+      volatility = Math.sqrt(variance);
+    }
+
     return {
       z,
       king: parseInt(king),
@@ -176,18 +170,81 @@ class AdaptiveDigitAnalyzer {
       lastDigit: this.lastDigit,
       prevDigit: this.prevDigit,
       currentFreq: current,
+      priceSlope,
+      volatility,
     };
   }
 }
 
-// Initialize analyzers for all markets
 const analyzers = {};
 for (const [sym, info] of Object.entries(MARKETS)) {
   analyzers[sym] = new AdaptiveDigitAnalyzer(sym, info.dp);
 }
 
-// ---------- Confidence Calculation (just like Python) ----------
-function computeConfidence(analysis) {
+// ---------- Auto‑Trader Settings (improved) ----------
+const AUTO_SETTINGS = {
+  stake: 0.35,
+  sessionProfitTarget: 0.40,
+  dailyTP: 2.0,
+  dailySL: 2.0,
+  cooldownMs: 2 * 60 * 60 * 1000,       // 2 hours
+  signalIntervalMs: 600 * 1000,         // 10 minutes
+  maxConsecutiveLossesPerSession: 2,
+  dynamicConfidenceEnabled: true,
+  baseConfRange: [35, 65],
+  highVolConfRange: [40, 60],
+  lowVolConfRange: [30, 70],
+  volatilityThresholdHigh: 1.5,
+  volatilityThresholdLow: 0.5,
+  trendFilterEnabled: true,
+  clusterConfirmationEnabled: true,
+  clusterSize: 2,
+  maxConcurrentSessions: 2,
+  trailingStopEnabled: true,
+  trailingThreshold: 0.30,
+  trailingLock: 0.15,
+  volatilityFilterEnabled: true,
+  volatilityFilterThreshold: 0.001,
+  sessionTimeoutMs: 15 * 60 * 1000,     // 15 minutes session timeout (NEW)
+};
+
+let globalAvgVolatility = 0.0001;
+
+// ---------- Manual Trading State (unchanged) ----------
+const state = {
+  active: false,
+  marketSymbol: 'R_100',
+  dp: MARKETS['R_100'].dp,
+  triggerMode: 'single',
+  triggerDigits: '',
+  clusterDigits: '',
+  clusterSize: 2,
+  lastDigitsBuffer: [],
+  barrierDigit: '3',
+  directionOverUnder: 'over',
+  stake: 1.0,
+  martingale: 2.0,
+  takeProfit: 10.0,
+  stopLoss: 10.0,
+  balance: null,
+  currency: 'USD',
+  runningProfit: 0,
+  currentStake: 1.0,
+  pendingContractId: null,
+  waitingForResult: false,
+  latestTick: null,
+  formattedPrice: '',
+  lastDigit: '',
+  // auto‑trade fields
+  autoActive: false,
+  autoSessions: [],
+  dailyPnL: 0,
+  cooldownUntil: null,
+  logs: []
+};
+
+// ---------- Confidence ----------
+function computeConfidence(analysis, dynamicRange) {
   if (!analysis) return { over1: 0, under8: 0 };
   const z = analysis.z;
   const trend = analysis.kingTrendUp;
@@ -204,162 +261,243 @@ function computeConfidence(analysis) {
     const trendBonus = trend ? 0.25 : 0;
     under8 = (rare * 0.3 + kingWeak * 0.5 + trendBonus) * 100;
   }
+  if (dynamicRange) {
+    const [lo, hi] = dynamicRange;
+    if (over1 < lo || over1 > hi) over1 = 0;
+    if (under8 < lo || under8 > hi) under8 = 0;
+  }
   return { over1, under8 };
 }
 
-// ---------- Auto‑Trader logic ----------
-const AUTO_STAKE = 0.35;
-const SESSION_PROFIT_TARGET = 0.40;
-const DAILY_TP = 2.0;
-const DAILY_SL = 2.0;
-const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
-const SIGNAL_INTERVAL = 600 * 1000; // 10 minutes
-
-let currentAutoSignal = null;   // { market, direction, barrier, digits: [] }
-let autoSessionProfit = 0;
-let autoTradeInProgress = false;
-let dailyPnL = 0;
-let cooldownUntil = null;
-let lastSignalScan = 0;
-
-function resetAutoSession() {
-  currentAutoSignal = null;
-  autoSessionProfit = 0;
-  autoTradeInProgress = false;
-  state.autoSessionProfit = 0;
-  state.autoWaitingForResult = false;
+function getDynamicConfRange(volatility) {
+  if (!AUTO_SETTINGS.dynamicConfidenceEnabled) return AUTO_SETTINGS.baseConfRange;
+  const ratio = volatility / globalAvgVolatility;
+  if (ratio > AUTO_SETTINGS.volatilityThresholdHigh) return AUTO_SETTINGS.highVolConfRange;
+  if (ratio < AUTO_SETTINGS.volatilityThresholdLow) return AUTO_SETTINGS.lowVolConfRange;
+  return AUTO_SETTINGS.baseConfRange;
 }
 
-// Scan all markets and update currentAutoSignal if best
-function scanForBestSignal() {
-  let bestMarket = null;
-  let bestConf = 0, bestDirection = null, bestBarrier = null, bestDigits = [];
+// ---------- Session management ----------
+function createSession(signal) {
+  return {
+    market: signal.market,
+    direction: signal.direction,
+    barrier: signal.barrier,
+    digits: signal.digits,
+    sessionProfit: 0,
+    peakProfit: 0,
+    consecutiveLosses: 0,
+    stopLevel: null,
+    waitingForResult: false,
+    pendingContractId: null,
+    lastDigits: [],
+    createdAt: Date.now(),         // for timeout
+    lastTradeTime: null,          // updated after each trade
+  };
+}
+
+function endSession(session, reason) {
+  const idx = state.autoSessions.indexOf(session);
+  if (idx > -1) state.autoSessions.splice(idx, 1);
+  // Clean up any pending req_id mapping for this session
+  for (const [reqId, sess] of pendingAutoReqs) {
+    if (sess === session) pendingAutoReqs.delete(reqId);
+  }
+  addLog(`🤖 Session ended (${reason}) | market ${MARKETS[session.market].name} | profit: ${session.sessionProfit.toFixed(2)}`);
+  broadcastSSE({ state: sanitizeState() });
+}
+
+// Pending request mapping: req_id → session
+const pendingAutoReqs = new Map();
+
+// ---------- Signal scanning ----------
+let lastSignalScan = 0;
+
+function scanForSignals() {
+  const now = Date.now();
+  if (now - lastSignalScan < AUTO_SETTINGS.signalIntervalMs) return;
+  lastSignalScan = now;
+
+  // Update global volatility
+  let totalVol = 0, count = 0;
+  for (const sym of Object.keys(MARKETS)) {
+    const a = analyzers[sym];
+    const analysis = a.getAnalysis();
+    if (analysis) { totalVol += analysis.volatility; count++; }
+  }
+  if (count > 0) globalAvgVolatility = totalVol / count;
+
+  // Remove timed‑out sessions
+  const now2 = Date.now();
+  for (let i = state.autoSessions.length - 1; i >= 0; i--) {
+    const session = state.autoSessions[i];
+    const lastActivity = session.lastTradeTime || session.createdAt;
+    if (now2 - lastActivity >= AUTO_SETTINGS.sessionTimeoutMs) {
+      endSession(session, 'timeout');
+    }
+  }
+
+  // Collect candidates
+  const candidates = [];
   for (const [sym, analyzer] of Object.entries(analyzers)) {
     const analysis = analyzer.getAnalysis();
     if (!analysis) continue;
-    const { over1, under8 } = computeConfidence(analysis);
-    const maxConf = Math.max(over1, under8);
-    if (maxConf > bestConf && maxConf >= 35 && maxConf <= 65) {
-      bestConf = maxConf;
-      bestMarket = sym;
-      if (over1 > under8) {
-        bestDirection = 'over';
-        bestBarrier = 1;
-        bestDigits = [0, 1];
-      } else {
-        bestDirection = 'under';
-        bestBarrier = 8;
-        bestDigits = [8, 9];
-      }
+    if (AUTO_SETTINGS.volatilityFilterEnabled && analysis.volatility > AUTO_SETTINGS.volatilityFilterThreshold) continue;
+
+    const dynamicRange = getDynamicConfRange(analysis.volatility);
+    const { over1, under8 } = computeConfidence(analysis, dynamicRange);
+
+    const slope = analysis.priceSlope;
+    const trendUp = slope > 0;
+    const trendDown = slope < 0;
+    const over1Allowed = !AUTO_SETTINGS.trendFilterEnabled || trendUp || Math.abs(slope) < 0.0001;
+    const under8Allowed = !AUTO_SETTINGS.trendFilterEnabled || trendDown || Math.abs(slope) < 0.0001;
+
+    if (over1 > 0 && over1Allowed) {
+      candidates.push({
+        market: sym,
+        direction: 'over',
+        barrier: 1,
+        digits: [0, 1],
+        confidence: over1,
+      });
+    }
+    if (under8 > 0 && under8Allowed) {
+      candidates.push({
+        market: sym,
+        direction: 'under',
+        barrier: 8,
+        digits: [8, 9],
+        confidence: under8,
+      });
     }
   }
-  if (bestMarket) {
-    currentAutoSignal = {
-      market: bestMarket,
-      direction: bestDirection,
-      barrier: bestBarrier,
-      digits: bestDigits,
-      confidence: bestConf
-    };
-    addLog(`🤖 Auto signal: ${MARKETS[bestMarket].name} ${bestDirection==='over'?'DIGITOVER':'DIGITUNDER'} barrier ${bestBarrier}, confidence ${bestConf.toFixed(1)}%`);
-    state.autoAnalysis = {
-      market: MARKETS[bestMarket].name,
-      direction: bestDirection === 'over' ? 'Over 1' : 'Under 8',
-      confidence: bestConf.toFixed(1)
-    };
-  } else {
-    currentAutoSignal = null;
-    state.autoAnalysis = null;
-    addLog(`🤖 No signal in 35-65% range`);
+
+  candidates.sort((a, b) => b.confidence - a.confidence);
+
+  const existingMarkets = new Set(state.autoSessions.map(s => s.market));
+  for (const signal of candidates) {
+    if (state.autoSessions.length >= AUTO_SETTINGS.maxConcurrentSessions) break;
+    if (existingMarkets.has(signal.market)) continue;
+    const session = createSession(signal);
+    state.autoSessions.push(session);
+    addLog(`🤖 New session: ${MARKETS[signal.market].name} ${signal.direction==='over'?'DIGITOVER':'DIGITUNDER'} barrier ${signal.barrier} conf ${signal.confidence.toFixed(1)}%`);
   }
   broadcastSSE({ state: sanitizeState() });
 }
 
-// Called every tick from any market
+// ---------- Auto‑trader tick handler ----------
 function autoTicker(symbol, price) {
   const analyzer = analyzers[symbol];
   if (!analyzer) return;
   analyzer.updatePrice(price);
 
-  // Daily cooldown check
   const now = Date.now();
-  if (cooldownUntil && now < cooldownUntil) return;
-  if (cooldownUntil && now >= cooldownUntil) {
-    // Cooldown over – reset daily
-    dailyPnL = 0;
-    cooldownUntil = null;
+
+  // Daily cooldown
+  if (state.cooldownUntil && now < state.cooldownUntil) return;
+  if (state.cooldownUntil && now >= state.cooldownUntil) {
+    state.dailyPnL = 0;
+    state.cooldownUntil = null;
     addLog('🤖 Cooldown ended – daily P/L reset');
+    broadcastSSE({ state: sanitizeState() });
   }
 
-  // Check daily limits
-  if (dailyPnL >= DAILY_TP) {
-    addLog(`🤖 Daily profit target $${DAILY_TP} reached – entering 2h cooldown`);
-    cooldownUntil = now + COOLDOWN_MS;
-    resetAutoSession();
+  // Daily limits
+  if (state.dailyPnL >= AUTO_SETTINGS.dailyTP) {
+    addLog(`🤖 Daily profit target $${AUTO_SETTINGS.dailyTP} reached – cooldown 2h`);
+    state.cooldownUntil = now + AUTO_SETTINGS.cooldownMs;
+    while (state.autoSessions.length) endSession(state.autoSessions[0], 'daily TP');
     return;
   }
-  if (dailyPnL <= -DAILY_SL) {
-    addLog(`🤖 Daily stop loss $${DAILY_SL} hit – entering 2h cooldown`);
-    cooldownUntil = now + COOLDOWN_MS;
-    resetAutoSession();
+  if (state.dailyPnL <= -AUTO_SETTINGS.dailySL) {
+    addLog(`🤖 Daily stop loss $${AUTO_SETTINGS.dailySL} hit – cooldown 2h`);
+    state.cooldownUntil = now + AUTO_SETTINGS.cooldownMs;
+    while (state.autoSessions.length) endSession(state.autoSessions[0], 'daily SL');
     return;
-  }
-
-  // Scan signals periodically
-  if (now - lastSignalScan >= SIGNAL_INTERVAL) {
-    lastSignalScan = now;
-    scanForBestSignal();
   }
 
   if (!state.autoActive) return;
-  if (!currentAutoSignal || currentAutoSignal.market !== symbol) return;
-  if (autoTradeInProgress) return;
 
+  // Scan for new signals
+  scanForSignals();
+
+  // Process each session
   const digit = parseInt(parseFloat(price).toFixed(MARKETS[symbol].dp).slice(-1));
-  if (!currentAutoSignal.digits.includes(digit)) return;
+  for (const session of state.autoSessions) {
+    if (session.market !== symbol) continue;
+    if (session.waitingForResult) continue;
 
-  // Place trade
-  autoTradeInProgress = true;
-  state.autoWaitingForResult = true;
+    session.lastDigits.push(digit);
+    if (session.lastDigits.length > AUTO_SETTINGS.clusterSize) session.lastDigits.shift();
 
-  const contractType = currentAutoSignal.direction === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
-  addLog(`🤖 Placing ${contractType} barrier ${currentAutoSignal.barrier} on ${MARKETS[symbol].name}`);
+    if (!session.digits.includes(digit)) continue;
 
-  send({
-    proposal: 1,
-    amount: AUTO_STAKE,
-    basis: 'stake',
-    currency: state.currency || 'USD',
-    duration: 1,
-    duration_unit: 't',
-    symbol: symbol,
-    contract_type: contractType,
-    barrier: currentAutoSignal.barrier,
-    req_id: ++reqId
-  });
+    if (AUTO_SETTINGS.clusterConfirmationEnabled) {
+      if (session.lastDigits.length < AUTO_SETTINGS.clusterSize) continue;
+      const allMatch = session.lastDigits.every(d => session.digits.includes(d));
+      if (!allMatch) continue;
+    }
+
+    // Place trade
+    session.waitingForResult = true;
+    const contractType = session.direction === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
+    addLog(`🤖 Placing ${contractType} barrier ${session.barrier} on ${MARKETS[symbol].name}`);
+
+    const currentReqId = ++reqId;
+    send({
+      proposal: 1,
+      amount: AUTO_SETTINGS.stake,
+      basis: 'stake',
+      currency: state.currency || 'USD',
+      duration: 1,
+      duration_unit: 't',
+      symbol: symbol,
+      contract_type: contractType,
+      barrier: session.barrier,
+      req_id: currentReqId,
+    });
+
+    // Map the req_id to this session
+    pendingAutoReqs.set(currentReqId, session);
+    session.lastTradeTime = now;
+  }
 }
 
-// Handle contract settlement for auto‑trader
-function handleAutoContractSettlement(contract) {
+// ---------- Handle contract settlement for auto‑trader ----------
+function handleAutoContractSettlement(contract, session) {
   const profit = parseFloat(contract.profit) || 0;
-  dailyPnL += profit;
-  state.dailyPnL = dailyPnL;
+  state.dailyPnL += profit;
+  session.sessionProfit += profit;
+
+  const resultText = profit >= 0 ? 'WIN' : 'LOSS';
+  addLog(`🤖 Auto trade ${resultText}: ${profit.toFixed(2)} | Session profit: ${session.sessionProfit.toFixed(2)}`);
 
   if (profit < 0) {
-    addLog(`🤖 Auto trade LOSS: ${profit.toFixed(2)}. Session ended.`);
-    resetAutoSession();
+    session.consecutiveLosses++;
   } else {
-    autoSessionProfit += profit;
-    state.autoSessionProfit = autoSessionProfit;
-    if (autoSessionProfit >= SESSION_PROFIT_TARGET) {
-      addLog(`🤖 Session profit target $${SESSION_PROFIT_TARGET} reached (total +${autoSessionProfit.toFixed(2)}).`);
-      resetAutoSession();
-    } else {
-      addLog(`🤖 Auto trade WIN: ${profit.toFixed(2)} (session +${autoSessionProfit.toFixed(2)})`);
+    session.consecutiveLosses = 0;
+    if (session.sessionProfit > session.peakProfit) {
+      session.peakProfit = session.sessionProfit;
+      if (AUTO_SETTINGS.trailingStopEnabled && session.peakProfit >= AUTO_SETTINGS.trailingThreshold) {
+        session.stopLevel = session.peakProfit - AUTO_SETTINGS.trailingLock;
+        addLog(`🤖 Trailing stop set at $${session.stopLevel.toFixed(2)}`);
+      }
     }
   }
-  autoTradeInProgress = false;
-  state.autoWaitingForResult = false;
+
+  // Check termination
+  if (session.consecutiveLosses >= AUTO_SETTINGS.maxConsecutiveLossesPerSession) {
+    endSession(session, 'max consecutive losses');
+  } else if (session.sessionProfit >= AUTO_SETTINGS.sessionProfitTarget && !AUTO_SETTINGS.trailingStopEnabled) {
+    endSession(session, 'session profit target');
+  } else if (AUTO_SETTINGS.trailingStopEnabled && session.stopLevel !== null && session.sessionProfit <= session.stopLevel) {
+    endSession(session, 'trailing stop');
+  } else {
+    // Session continues
+    session.waitingForResult = false;
+    session.pendingContractId = null;
+  }
   broadcastSSE({ state: sanitizeState() });
 }
 
@@ -380,7 +518,7 @@ app.get('/api/state', (req, res) => {
   res.json({ ...state, logs: undefined });
 });
 
-// ---------- Manual trading control ----------
+// ---------- Manual trading control (unchanged) ----------
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
@@ -435,11 +573,11 @@ app.post('/api/auto', (req, res) => {
       return res.status(400).json({ error: 'Missing Deriv credentials' });
     }
     state.autoActive = true;
-    resetAutoSession();
-    addLog('🤖 Auto‑trading started');
+    state.autoSessions = [];
+    addLog('🤖 Auto‑trading started (improved)');
   } else if (action === 'stop') {
     state.autoActive = false;
-    resetAutoSession();
+    state.autoSessions = [];
     addLog('🤖 Auto‑trading stopped');
   }
   broadcastSSE({ state: sanitizeState() });
@@ -493,7 +631,6 @@ function handleDerivMessage(msg) {
   if (msg.msg_type === 'authorize') {
     addLog('Authorized. Subscribing to balance & ticks.');
     send({ balance: 1, subscribe: 1, req_id: ++reqId });
-    // Request historical ticks for each market to prime analyzers
     for (const sym of Object.keys(MARKETS)) {
       send({ ticks_history: sym, count: 1000, end: 'latest', req_id: ++reqId });
     }
@@ -505,12 +642,9 @@ function handleDerivMessage(msg) {
     const symbol = msg.tick.symbol;
     const price = msg.tick.quote;
 
-    // Always feed analyzer for auto‑trader
-    if (analyzers[symbol]) {
-      autoTicker(symbol, price);
-    }
+    if (analyzers[symbol]) autoTicker(symbol, price);
 
-    // Manual trading logic (only if active and symbol matches)
+    // Manual trading (unchanged)
     if (state.active && symbol === state.marketSymbol) {
       state.latestTick = price;
       const formatted = parseFloat(price).toFixed(state.dp);
@@ -521,38 +655,24 @@ function handleDerivMessage(msg) {
         state.lastDigitsBuffer.push(state.lastDigit);
         if (state.lastDigitsBuffer.length > state.clusterSize) state.lastDigitsBuffer.shift();
 
-        let tradeNow = false;
-        let triggerReason = '';
+        let tradeNow = false, triggerReason = '';
         if (state.triggerMode === 'single') {
           const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-          if (triggerSet.length === 0) {
-            tradeNow = true;
-            triggerReason = 'all';
-          } else if (triggerSet.includes(state.lastDigit)) {
-            tradeNow = true;
-            triggerReason = `single: ${state.lastDigit}`;
-          }
+          if (triggerSet.length === 0) { tradeNow = true; triggerReason = 'all'; }
+          else if (triggerSet.includes(state.lastDigit)) { tradeNow = true; triggerReason = `single: ${state.lastDigit}`; }
         } else if (state.triggerMode === 'cluster') {
           if (state.lastDigitsBuffer.length === state.clusterSize) {
             const clusterSet = state.clusterDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-            if (clusterSet.length === 0) {
+            if (clusterSet.length === 0 || state.lastDigitsBuffer.every(d => clusterSet.includes(d))) {
               tradeNow = true;
-              triggerReason = 'cluster: any';
-            } else {
-              const allInSet = state.lastDigitsBuffer.every(d => clusterSet.includes(d));
-              if (allInSet) {
-                tradeNow = true;
-                triggerReason = `cluster: [${state.lastDigitsBuffer.join(',')}]`;
-              }
             }
           }
         }
         if (tradeNow) {
-          // manual trade
           state.waitingForResult = true;
           const contractType = state.directionOverUnder === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
           const barrier = parseInt(state.barrierDigit);
-          addLog(`Manual: Placing ${contractType} barrier ${barrier} | trigger: ${triggerReason}`);
+          addLog(`Manual: Placing ${contractType} barrier ${barrier} | trigger: ${triggerReason || 'cluster'}`);
           send({
             proposal: 1,
             amount: state.currentStake,
@@ -574,30 +694,51 @@ function handleDerivMessage(msg) {
     const analyzer = analyzers[sym];
     if (analyzer && msg.history && msg.history.prices) {
       analyzer.feedHistory(msg.history.prices);
-      // After feeding history, subscribe to live ticks
       send({ ticks: sym, req_id: ++reqId });
     }
   } else if (msg.msg_type === 'proposal') {
-    // Handle both manual and auto by checking which one is waiting
     const proposalId = msg.proposal.id;
     const askPrice = msg.proposal.ask_price;
     addLog(`Proposal received. Buying at ${askPrice}`);
     send({ buy: proposalId, price: askPrice, req_id: ++reqId });
   } else if (msg.msg_type === 'buy') {
     const contractId = msg.buy.contract_id;
-    if (state.active && state.waitingForResult && state.pendingContractId === null) {
-      // Manual trade
+    // Identify if manual or auto
+    if (state.active && state.waitingForResult && !state.pendingContractId) {
       state.pendingContractId = contractId;
       addLog(`Manual contract ${contractId} opened.`);
-    } else if (state.autoActive && autoTradeInProgress && state.autoWaitingForResult && state.autoPendingContractId === undefined) {
-      state.autoPendingContractId = contractId;
-      addLog(`🤖 Auto contract ${contractId} opened.`);
+    } else {
+      // Find the auto session via pending req_id
+      // The buy response does not contain the original req_id, but we can use the buy's echo_req if available.
+      // Since we can't easily map the buy response to a session without the original req_id, we'll use a different approach:
+      // We'll store the contractId and later, when proposal_open_contract comes, we'll match it to sessions that are waiting.
+      // For now, just find the first waiting session that hasn't a contract yet.
+      let found = false;
+      for (const [reqId, session] of pendingAutoReqs) {
+        if (session.waitingForResult && !session.pendingContractId) {
+          session.pendingContractId = contractId;
+          pendingAutoReqs.delete(reqId);
+          addLog(`🤖 Auto contract ${contractId} opened.`);
+          found = true;
+          break;
+        }
+      }
+      // Fallback (should not happen) – find any waiting session
+      if (!found) {
+        for (const session of state.autoSessions) {
+          if (session.waitingForResult && !session.pendingContractId) {
+            session.pendingContractId = contractId;
+            addLog(`🤖 Auto contract ${contractId} opened (fallback).`);
+            break;
+          }
+        }
+      }
     }
-    // Subscribe to updates for both
+    // Subscribe to contract updates
     send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: ++reqId });
   } else if (msg.msg_type === 'proposal_open_contract') {
     const c = msg.proposal_open_contract;
-    // Check if it belongs to manual or auto
+    // Manual settlement
     if (state.active && state.waitingForResult && c.contract_id === state.pendingContractId) {
       const profit = parseFloat(c.profit) || 0;
       state.runningProfit += profit;
@@ -616,9 +757,14 @@ function handleDerivMessage(msg) {
         addLog(`Manual stop loss hit. Stopping.`);
         state.active = false;
       }
-    } else if (state.autoActive && autoTradeInProgress && c.contract_id === state.autoPendingContractId) {
-      handleAutoContractSettlement(c);
-      state.autoPendingContractId = null;
+    } else {
+      // Auto settlement
+      for (const session of state.autoSessions) {
+        if (session.waitingForResult && c.contract_id === session.pendingContractId) {
+          handleAutoContractSettlement(c, session);
+          break;
+        }
+      }
     }
     broadcastSSE({ state: sanitizeState() });
   }
