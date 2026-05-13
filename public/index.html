@@ -23,14 +23,12 @@
 <body>
 <div class="container">
   <h2>Professional Mode</h2>
-
   <div class="stat">
     <div>Balance: <span id="balance" class="big green">--</span></div>
     <div>Daily P&L: <span id="dailyPnl" class="big">--</span></div>
     <div>Active trades: <span id="activeCount" class="big orange">0</span></div>
     <div id="lockStatus" class="red" style="display:none;">⚠️ Daily limit reached – bot locked</div>
   </div>
-
   <div class="stat">
     <div class="settings">
       <label>Min Confidence % <input id="minConf" type="number" value="45" min="35" max="65"></label>
@@ -41,25 +39,18 @@
       <label>Trend filter <input id="trendFilter" type="checkbox" checked></label>
     </div>
   </div>
-
   <div>
     <button class="btn btn-start" id="startBtn" onclick="start()">Start Trading</button>
     <button class="btn btn-stop" id="stopBtn" onclick="stop()" disabled>Stop Trading</button>
   </div>
-
-  <!-- Confidence display table -->
   <h3>Live Confidence</h3>
   <table>
     <tr><th>Market</th><th>Over %</th><th>Under %</th><th>Trend</th><th>Best</th></tr>
-    <tbody id="signalTable">
-      <!-- rows injected -->
-    </tbody>
+    <tbody id="signalTable"></tbody>
   </table>
-
   <h3>Logs</h3>
   <div id="logs"></div>
 </div>
-
 <script>
 const es = new EventSource('/api/logs');
 es.onmessage = e => {
@@ -74,9 +65,7 @@ es.onmessage = e => {
     });
   }
 };
-
 const marketOrder = ['R_10','R_25','R_50','R_75','R_100'];
-
 function updateUI(s) {
   document.getElementById('balance').textContent = s.balance ? `${parseFloat(s.balance).toFixed(2)} ${s.currency}` : '--';
   document.getElementById('dailyPnl').textContent = s.dailyPnl !== undefined ? `${s.dailyPnl.toFixed(2)} USD` : '--';
@@ -84,14 +73,10 @@ function updateUI(s) {
   document.getElementById('lockStatus').style.display = s.locked ? 'block' : 'none';
   document.getElementById('startBtn').disabled = s.active;
   document.getElementById('stopBtn').disabled = !s.active;
-
-  // Update signal table
-  const tbody = document.getElementById('signalTable');
-  tbody.innerHTML = '';
+  const tbody = document.getElementById('signalTable'); tbody.innerHTML = '';
   if (s.marketSignals) {
     for (const sym of marketOrder) {
-      const sig = s.marketSignals[sym];
-      if (!sig) continue;
+      const sig = s.marketSignals[sym]; if (!sig) continue;
       const tr = document.createElement('tr');
       const bestDir = sig.bestDirection === 'over' ? '↑' : (sig.bestDirection === 'under' ? '↓' : '');
       const trendIcon = sig.trend === 'up' ? '↑' : (sig.trend === 'down' ? '↓' : '→');
@@ -100,7 +85,6 @@ function updateUI(s) {
     }
   }
 }
-
 function start() {
   const config = {
     minConfidence: document.getElementById('minConf').value,
@@ -113,9 +97,7 @@ function start() {
   fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'update', ...config})})
     .then(() => fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'start'})}));
 }
-function stop() {
-  fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'})});
-}
+function stop() { fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'})}); }
 </script>
 </body>
 </html>
