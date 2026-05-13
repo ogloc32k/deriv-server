@@ -24,6 +24,9 @@
   .hidden { display: none; }
   .tick-box { font-size: 28px; background: #000; color: #0f0; padding: 5px 15px; border-radius: 6px; font-family: monospace; }
   .last-digit { font-size: 36px; font-weight: bold; margin-top: 5px; }
+  .mode-virtual { color: #ff9800; font-weight: bold; }
+  .mode-real { color: #2e7d32; font-weight: bold; }
+  .section-title { font-size: 18px; font-weight: bold; margin: 16px 0 8px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
 </style>
 </head>
 <body>
@@ -34,11 +37,12 @@
     <div class="stat-box"><div>Status</div><div class="stat-value" id="serverStatus">Connecting...</div></div>
     <div class="stat-box"><div>Account Balance</div><div class="stat-value" id="balanceDisplay">--</div></div>
     <div class="stat-box"><div>Running P/L</div><div class="stat-value" id="profitDisplay">0.00</div></div>
+    <div class="stat-box"><div>Mode</div><div class="stat-value" id="modeDisplay">--</div></div>
   </div>
 
   <div class="stats">
     <div class="stat-box" style="background:#fff3e0;">
-      <div>Current Tick (formatted)</div>
+      <div>Current Tick</div>
       <div class="tick-box" id="tickPrice">--</div>
     </div>
     <div class="stat-box" style="background:#fce4ec;">
@@ -47,56 +51,30 @@
     </div>
   </div>
 
+  <!-- Market & Trigger Settings -->
   <div class="row">
-    <div class="col">
-      <label>Market Symbol</label>
-      <select id="marketSymbol">
-        <option value="R_10">V10 (dp=3)</option>
-        <option value="R_25">V25 (dp=3)</option>
-        <option value="R_50">V50 (dp=4)</option>
-        <option value="R_75">V75 (dp=4)</option>
-        <option value="R_100" selected>V100 (dp=2)</option>
-      </select>
-    </div>
-    <div class="col">
-      <label>Trigger Mode</label>
-      <select id="triggerMode">
-        <option value="single" selected>Single Digit</option>
-        <option value="cluster">Cluster Digits</option>
-      </select>
-    </div>
+    <div class="col"><label>Market</label><select id="marketSymbol"><option value="R_10">V10</option><option value="R_25">V25</option><option value="R_50">V50</option><option value="R_75">V75</option><option value="R_100" selected>V100</option></select></div>
+    <div class="col"><label>Trigger Mode</label><select id="triggerMode"><option value="single" selected>Single</option><option value="cluster">Cluster</option></select></div>
   </div>
-
-  <div id="singleDigitsBlock" class="row">
-    <div class="col">
-      <label>Trigger Digits (comma, empty=all)</label>
-      <input type="text" id="triggerDigits" placeholder="e.g. 1,2,3" value="5">
-    </div>
-  </div>
-  <div id="clusterDigitsBlock" class="row hidden">
-    <div class="col">
-      <label>Cluster Digits</label>
-      <input type="text" id="clusterDigits" value="0,1,2,3">
-    </div>
-    <div class="col">
-      <label>Cluster Size</label>
-      <input type="number" id="clusterSize" min="2" max="10" value="2">
-    </div>
-  </div>
-
+  <div id="singleDigitsBlock" class="row"><div class="col"><label>Trigger Digits</label><input id="triggerDigits" value="5"></div></div>
+  <div id="clusterDigitsBlock" class="row hidden"><div class="col"><label>Cluster Digits</label><input id="clusterDigits" value="0,1,2,3"></div><div class="col"><label>Cluster Size</label><input type="number" id="clusterSize" value="2"></div></div>
   <div class="row">
-    <div class="col"><label>Direction</label>
-      <select id="directionOverUnder">
-        <option value="over" selected>DIGITOVER</option>
-        <option value="under">DIGITUNDER</option>
-      </select>
-    </div>
-    <div class="col"><label>Barrier Digit</label><input type="number" id="barrierDigit" value="3"></div>
+    <div class="col"><label>Direction</label><select id="directionOverUnder"><option value="over">DIGITOVER</option><option value="under">DIGITUNDER</option></select></div>
+    <div class="col"><label>Barrier</label><input type="number" id="barrierDigit" value="3"></div>
     <div class="col"><label>Stake</label><input type="number" id="stake" step="0.01" value="1.00"></div>
     <div class="col"><label>Martingale</label><input type="number" id="martingale" step="0.1" value="2.0"></div>
     <div class="col"><label>Take Profit</label><input type="number" id="takeProfit" step="0.01" value="10.00"></div>
     <div class="col"><label>Stop Loss</label><input type="number" id="stopLoss" step="0.01" value="10.00"></div>
   </div>
+
+  <!-- Virtual Trading Settings -->
+  <div class="section-title">Virtual Trading</div>
+  <div class="row">
+    <div class="col"><label>Virtual Pattern (L/W)</label><input type="text" id="virtualPattern" placeholder="e.g. LLW" value="LLL"></div>
+    <div class="col"><label>After Real Win</label><select id="winAction"><option value="back_to_virtual" selected>Back to Virtual</option><option value="real_until_loss">Continue Real until Loss</option></select></div>
+    <div class="col"><label>After Real Loss</label><select id="lossAction"><option value="back_to_virtual" selected>Back to Virtual</option><option value="real_until_win">Continue Real until Win</option></select></div>
+  </div>
+
   <div>
     <button class="btn-start" id="startBtn" onclick="startManual()">▶ Start Trading</button>
     <button class="btn-stop" id="stopBtn" onclick="stopManual()" disabled>⏹ Stop Trading</button>
@@ -140,6 +118,11 @@ function updateUI(s) {
     document.getElementById('tickPrice').textContent = s.formattedPrice;
     document.getElementById('lastDigit').textContent = s.lastDigit || '';
   }
+  if (s.tradingMode) {
+    const modeEl = document.getElementById('modeDisplay');
+    modeEl.textContent = s.tradingMode === 'virtual' ? 'Virtual' : 'Real';
+    modeEl.className = s.tradingMode === 'virtual' ? 'mode-virtual' : 'mode-real';
+  }
 }
 
 fetch('/api/state').then(r => r.json()).then(s => {
@@ -154,6 +137,9 @@ fetch('/api/state').then(r => r.json()).then(s => {
   document.getElementById('martingale').value = s.martingale;
   document.getElementById('takeProfit').value = s.takeProfit;
   document.getElementById('stopLoss').value = s.stopLoss;
+  document.getElementById('virtualPattern').value = s.virtualPattern || '';
+  document.getElementById('winAction').value = s.winAction || 'back_to_virtual';
+  document.getElementById('lossAction').value = s.lossAction || 'back_to_virtual';
   toggleModeFields();
   updateUI(s);
 });
@@ -177,7 +163,10 @@ function startManual() {
     stake: parseFloat(document.getElementById('stake').value),
     martingale: parseFloat(document.getElementById('martingale').value),
     takeProfit: parseFloat(document.getElementById('takeProfit').value),
-    stopLoss: parseFloat(document.getElementById('stopLoss').value)
+    stopLoss: parseFloat(document.getElementById('stopLoss').value),
+    virtualPattern: document.getElementById('virtualPattern').value,
+    winAction: document.getElementById('winAction').value,
+    lossAction: document.getElementById('lossAction').value
   };
   fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'update',...payload})})
     .then(() => fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'start'})}));
