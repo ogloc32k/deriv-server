@@ -39,37 +39,58 @@ const MARKETS = {
   "R_100": { name: "V100", dp: 2 }
 };
 
-// ---------- AdaptiveDigitAnalyzer (JS version) ----------
+// ---------- AdaptiveDigitAnalyzer (multi‑timeframe + bias correction) ----------
 class AdaptiveDigitAnalyzer {
   constructor(symbol, dp) {
     this.symbol = symbol;
     this.dp = dp;
+
     this.ticks = [];
     this.prices = [];
     this.maxTicks = 1000;
     this.lastDigit = null;
     this.prevDigit = null;
-    this.snapshotFreqs = [];
-    this.maxSnapshots = 15;
     this.snapshotCounter = 0;
-    this.kingHistory = [];
-    this.kingFreqHistory = [];
+    this.shortSnapshotFreqs = [];
+    this.maxShortSnapshots = 15;
+    this.shortStats = { mean: new Array(10).fill(0), m2: new Array(10).fill(0), count: 0 };
+
+    this.longWindow = [];
+    this.longCounts = new Array(10).fill(0);
+    this.longSnapshotCounter = 0;
+    this.longSnapshotFreqs = [];
+    this.maxLongSnapshots = 5;
+    this.longStats = { mean: new Array(10).fill(0), m2: new Array(10).fill(0), count: 0 };
   }
 
   updatePrice(price) {
     const digit = parseInt(parseFloat(price).toFixed(this.dp).slice(-1));
     this.prevDigit = this.lastDigit;
     this.lastDigit = digit;
+
     this.ticks.push(digit);
     this.prices.push(price);
     if (this.ticks.length > this.maxTicks) {
       this.ticks.shift();
       this.prices.shift();
     }
+
     this.snapshotCounter++;
     if (this.snapshotCounter >= 100) {
-      this._takeSnapshot();
+      this._takeShortSnapshot();
       this.snapshotCounter = 0;
+    }
+
+    this.longWindow.push(digit);
+    this.longCounts[digit]++;
+    if (this.longWindow.length > 500) {
+      const removed = this.longWindow.shift();
+      this.longCounts[removed]--;
+    }
+    this.longSnapshotCounter++;
+    if (this.longSnapshotCounter >= 500 && this.longWindow.length >= 500) {
+      this._takeLongSnapshot();
+      this.longSnapshotCounter = 0;
     }
   }
 
@@ -79,56 +100,88 @@ class AdaptiveDigitAnalyzer {
     }
   }
 
-  _takeSnapshot() {
+  _takeShortSnapshot() {
     if (this.ticks.length < 100) return;
     const recent = this.ticks.slice(-100);
     const freq = {};
+    for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
+    this.shortSnapshotFreqs.push(freq);
+    if (this.shortSnapshotFreqs.length > this.maxShortSnapshots) this.shortSnapshotFreqs.shift();
+    const stats = this.shortStats;
+    stats.count++;
     for (let d = 0; d < 10; d++) {
-      freq[d] = recent.filter(x => x === d).length / 100;
-    }
-    this.snapshotFreqs.push(freq);
-    if (this.snapshotFreqs.length > this.maxSnapshots) this.snapshotFreqs.shift();
-    const king = Object.keys(freq).reduce((a, b) => freq[a] > freq[b] ? a : b, '0');
-    this.kingHistory.push(parseInt(king));
-    this.kingFreqHistory.push(freq[king]);
-    if (this.kingHistory.length > 5) {
-      this.kingHistory.shift();
-      this.kingFreqHistory.shift();
+      const delta = freq[d] - stats.mean[d];
+      stats.mean[d] += delta / stats.count;
+      const delta2 = freq[d] - stats.mean[d];
+      stats.m2[d] += delta * delta2;
     }
   }
 
-  getAnalysis() {
-    if (this.snapshotFreqs.length < 5) return null;
-    const means = {}, stds = {};
+  _takeLongSnapshot() {
+    if (this.longWindow.length < 500) return;
+    const freq = {};
+    for (let d = 0; d < 10; d++) freq[d] = this.longCounts[d] / 500;
+    this.longSnapshotFreqs.push(freq);
+    if (this.longSnapshotFreqs.length > this.maxLongSnapshots) this.longSnapshotFreqs.shift();
+    const stats = this.longStats;
+    stats.count++;
     for (let d = 0; d < 10; d++) {
-      const vals = this.snapshotFreqs.map(snap => snap[d]);
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      means[d] = mean;
-      const variance = vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length;
-      stds[d] = Math.sqrt(variance) || 0.01;
+      const delta = freq[d] - stats.mean[d];
+      stats.mean[d] += delta / stats.count;
+      const delta2 = freq[d] - stats.mean[d];
+      stats.m2[d] += delta * delta2;
     }
-    const current = this.snapshotFreqs[this.snapshotFreqs.length - 1];
+  }
+
+  _getBaselineZ(freq, stats) {
     const z = {};
     for (let d = 0; d < 10; d++) {
-      z[d] = (current[d] - means[d]) / stds[d];
+      const mean = stats.mean[d];
+      const variance = stats.count > 1 ? stats.m2[d] / (stats.count - 1) : 0.0001;
+      const std = Math.sqrt(variance) || 0.01;
+      z[d] = (freq[d] - mean) / std;
     }
-    const king = Object.keys(z).reduce((a, b) => z[a] > z[b] ? a : b, '0');
-    const slave = Object.keys(z).reduce((a, b) => z[a] < z[b] ? a : b, '0');
+    return z;
+  }
+
+  getAnalysis() {
+    if (this.shortStats.count < 5 || this.longStats.count < 2) return null;
+
+    const currentShortFreq = this.shortSnapshotFreqs.length > 0
+      ? this.shortSnapshotFreqs[this.shortSnapshotFreqs.length - 1]
+      : (() => {
+          if (this.ticks.length < 100) return null;
+          const recent = this.ticks.slice(-100);
+          const f = {};
+          for (let d = 0; d < 10; d++) f[d] = recent.filter(x => x === d).length / 100;
+          return f;
+        })();
+    if (!currentShortFreq) return null;
+
+    if (this.longWindow.length < 500) return null;
+    const currentLongFreq = {};
+    for (let d = 0; d < 10; d++) currentLongFreq[d] = this.longCounts[d] / 500;
+
+    const z_short = this._getBaselineZ(currentShortFreq, this.shortStats);
+    const z_long  = this._getBaselineZ(currentLongFreq,  this.longStats);
+
+    const king = Object.keys(currentShortFreq).reduce((a, b) => currentShortFreq[a] > currentShortFreq[b] ? a : b, '0');
+    const kingZ = z_short[king];
+
     let trendUp = false;
-    if (this.kingFreqHistory.length >= 2) {
-      const n = this.kingFreqHistory.length;
+    if (this.shortSnapshotFreqs.length >= 2) {
+      const n = this.shortSnapshotFreqs.length;
+      const y = this.shortSnapshotFreqs.map(s => s[king]);
       let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
       for (let i = 0; i < n; i++) {
-        sumX += i;
-        sumY += this.kingFreqHistory[i];
-        sumXY += i * this.kingFreqHistory[i];
-        sumX2 += i * i;
+        sumX += i; sumY += y[i]; sumXY += i * y[i]; sumX2 += i * i;
       }
       const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
       trendUp = slope > 0.002;
     }
+
     let entropy = 0;
-    for (const v of Object.values(current)) {
+    for (const v of Object.values(currentShortFreq)) {
       if (v > 0) entropy -= v * Math.log(v);
     }
     const maxEntropy = Math.log(10);
@@ -140,10 +193,7 @@ class AdaptiveDigitAnalyzer {
       const n = recentPrices.length;
       let sx = 0, sy = 0, sxy = 0, sx2 = 0;
       for (let i = 0; i < n; i++) {
-        sx += i;
-        sy += recentPrices[i];
-        sxy += i * recentPrices[i];
-        sx2 += i * i;
+        sx += i; sy += recentPrices[i]; sxy += i * recentPrices[i]; sx2 += i * i;
       }
       priceSlope = (n * sxy - sx * sy) / (n * sx2 - sx * sx);
     }
@@ -160,18 +210,9 @@ class AdaptiveDigitAnalyzer {
     }
 
     return {
-      z,
-      king: parseInt(king),
-      slave: parseInt(slave),
-      kingZ: z[king],
-      slaveZ: z[slave],
-      kingTrendUp: trendUp,
-      entropy: normEntropy,
-      lastDigit: this.lastDigit,
-      prevDigit: this.prevDigit,
-      currentFreq: current,
-      priceSlope,
-      volatility,
+      z_short, z_long, king: parseInt(king), kingZ, kingTrendUp: trendUp,
+      entropy: normEntropy, lastDigit: this.lastDigit, prevDigit: this.prevDigit,
+      currentShortFreq, currentLongFreq, priceSlope, volatility,
     };
   }
 }
@@ -181,14 +222,14 @@ for (const [sym, info] of Object.entries(MARKETS)) {
   analyzers[sym] = new AdaptiveDigitAnalyzer(sym, info.dp);
 }
 
-// ---------- Auto‑Trader Settings (improved) ----------
+// ---------- Auto‑Trader Settings ----------
 const AUTO_SETTINGS = {
   stake: 0.35,
   sessionProfitTarget: 0.40,
   dailyTP: 2.0,
   dailySL: 2.0,
-  cooldownMs: 2 * 60 * 60 * 1000,       // 2 hours
-  signalIntervalMs: 600 * 1000,         // 10 minutes
+  cooldownMs: 2 * 60 * 60 * 1000,
+  signalIntervalMs: 600 * 1000,
   maxConsecutiveLossesPerSession: 2,
   dynamicConfidenceEnabled: true,
   baseConfRange: [35, 65],
@@ -205,12 +246,12 @@ const AUTO_SETTINGS = {
   trailingLock: 0.15,
   volatilityFilterEnabled: true,
   volatilityFilterThreshold: 0.001,
-  sessionTimeoutMs: 15 * 60 * 1000,     // 15 minutes session timeout (NEW)
+  sessionTimeoutMs: 15 * 60 * 1000,
 };
 
 let globalAvgVolatility = 0.0001;
 
-// ---------- Manual Trading State (unchanged) ----------
+// ---------- Manual Trading State ----------
 const state = {
   active: false,
   marketSymbol: 'R_100',
@@ -235,7 +276,6 @@ const state = {
   latestTick: null,
   formattedPrice: '',
   lastDigit: '',
-  // auto‑trade fields
   autoActive: false,
   autoSessions: [],
   dailyPnL: 0,
@@ -243,19 +283,54 @@ const state = {
   logs: []
 };
 
-// ---------- Confidence ----------
+// ---------- Dynamic barrier selection ----------
+const HOUSE_EDGE_FACTOR = 0.98;
+
+function getFairPayoutOver(barrier) {
+  if (barrier >= 9) return 1;
+  return (10 / (9 - barrier)) * HOUSE_EDGE_FACTOR;
+}
+
+function getFairPayoutUnder(barrier) {
+  if (barrier <= 0) return 1;
+  return (10 / barrier) * HOUSE_EDGE_FACTOR;
+}
+
+function selectOptimalBarrier(direction, freq) {
+  let bestBarrier = null, bestProfit = -Infinity;
+
+  if (direction === 'over') {
+    for (let n = 0; n <= 8; n++) {
+      let winProb = 0;
+      for (let d = n + 1; d <= 9; d++) winProb += (freq[d] || 0);
+      const profit = winProb * getFairPayoutOver(n) - 1;
+      if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
+    }
+  } else {
+    for (let n = 1; n <= 9; n++) {
+      let winProb = 0;
+      for (let d = 0; d < n; d++) winProb += (freq[d] || 0);
+      const profit = winProb * getFairPayoutUnder(n) - 1;
+      if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
+    }
+  }
+  if (bestProfit <= 0) return null;
+  return { barrier: bestBarrier, expectedProfit: bestProfit };
+}
+
+// ---------- Confidence calculator ----------
 function computeConfidence(analysis, dynamicRange) {
   if (!analysis) return { over1: 0, under8: 0 };
-  const z = analysis.z;
+  const z = analysis.z_short;
   const trend = analysis.kingTrendUp;
   let over1 = 0, under8 = 0;
-  if (z[0] < 0 && z[1] < 0) {
+  if (z[0] < 0 && z[1] < 0 && analysis.z_long[0] < 0 && analysis.z_long[1] < 0) {
     const rare = Math.min(3, Math.max(0, -Math.min(z[0], z[1]))) / 3;
     const kingStrength = Math.min(1, Math.max(0, analysis.kingZ / 3));
     const trendBonus = trend ? 0.25 : 0;
     over1 = (rare * 0.3 + kingStrength * 0.5 + trendBonus) * 100;
   }
-  if (z[8] < 0 && z[9] < 0) {
+  if (z[8] < 0 && z[9] < 0 && analysis.z_long[8] < 0 && analysis.z_long[9] < 0) {
     const rare = Math.min(3, Math.max(0, -Math.min(z[8], z[9]))) / 3;
     const kingWeak = Math.min(1, Math.max(0, -analysis.kingZ / 3));
     const trendBonus = trend ? 0.25 : 0;
@@ -291,15 +366,14 @@ function createSession(signal) {
     waitingForResult: false,
     pendingContractId: null,
     lastDigits: [],
-    createdAt: Date.now(),         // for timeout
-    lastTradeTime: null,          // updated after each trade
+    createdAt: Date.now(),
+    lastTradeTime: null,
   };
 }
 
 function endSession(session, reason) {
   const idx = state.autoSessions.indexOf(session);
   if (idx > -1) state.autoSessions.splice(idx, 1);
-  // Clean up any pending req_id mapping for this session
   for (const [reqId, sess] of pendingAutoReqs) {
     if (sess === session) pendingAutoReqs.delete(reqId);
   }
@@ -307,10 +381,9 @@ function endSession(session, reason) {
   broadcastSSE({ state: sanitizeState() });
 }
 
-// Pending request mapping: req_id → session
 const pendingAutoReqs = new Map();
 
-// ---------- Signal scanning ----------
+// ---------- Signal scanning (with dynamic barrier) ----------
 let lastSignalScan = 0;
 
 function scanForSignals() {
@@ -318,7 +391,6 @@ function scanForSignals() {
   if (now - lastSignalScan < AUTO_SETTINGS.signalIntervalMs) return;
   lastSignalScan = now;
 
-  // Update global volatility
   let totalVol = 0, count = 0;
   for (const sym of Object.keys(MARKETS)) {
     const a = analyzers[sym];
@@ -337,7 +409,6 @@ function scanForSignals() {
     }
   }
 
-  // Collect candidates
   const candidates = [];
   for (const [sym, analyzer] of Object.entries(analyzers)) {
     const analysis = analyzer.getAnalysis();
@@ -354,22 +425,28 @@ function scanForSignals() {
     const under8Allowed = !AUTO_SETTINGS.trendFilterEnabled || trendDown || Math.abs(slope) < 0.0001;
 
     if (over1 > 0 && over1Allowed) {
-      candidates.push({
-        market: sym,
-        direction: 'over',
-        barrier: 1,
-        digits: [0, 1],
-        confidence: over1,
-      });
+      const optimal = selectOptimalBarrier('over', analysis.currentShortFreq);
+      if (optimal) {
+        candidates.push({
+          market: sym,
+          direction: 'over',
+          barrier: optimal.barrier,
+          digits: [0, 1],
+          confidence: over1,
+        });
+      }
     }
     if (under8 > 0 && under8Allowed) {
-      candidates.push({
-        market: sym,
-        direction: 'under',
-        barrier: 8,
-        digits: [8, 9],
-        confidence: under8,
-      });
+      const optimal = selectOptimalBarrier('under', analysis.currentShortFreq);
+      if (optimal) {
+        candidates.push({
+          market: sym,
+          direction: 'under',
+          barrier: optimal.barrier,
+          digits: [8, 9],
+          confidence: under8,
+        });
+      }
     }
   }
 
@@ -381,12 +458,12 @@ function scanForSignals() {
     if (existingMarkets.has(signal.market)) continue;
     const session = createSession(signal);
     state.autoSessions.push(session);
-    addLog(`🤖 New session: ${MARKETS[signal.market].name} ${signal.direction==='over'?'DIGITOVER':'DIGITUNDER'} barrier ${signal.barrier} conf ${signal.confidence.toFixed(1)}%`);
+    addLog(`🤖 New session: ${MARKETS[signal.market].name} ${signal.direction==='over'?'DIGITOVER':'DIGITUNDER'} barrier ${signal.barrier} (edge ${signal.confidence.toFixed(1)}%)`);
   }
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- Auto‑trader tick handler ----------
+// ---------- Auto ticker ----------
 function autoTicker(symbol, price) {
   const analyzer = analyzers[symbol];
   if (!analyzer) return;
@@ -394,7 +471,6 @@ function autoTicker(symbol, price) {
 
   const now = Date.now();
 
-  // Daily cooldown
   if (state.cooldownUntil && now < state.cooldownUntil) return;
   if (state.cooldownUntil && now >= state.cooldownUntil) {
     state.dailyPnL = 0;
@@ -403,7 +479,6 @@ function autoTicker(symbol, price) {
     broadcastSSE({ state: sanitizeState() });
   }
 
-  // Daily limits
   if (state.dailyPnL >= AUTO_SETTINGS.dailyTP) {
     addLog(`🤖 Daily profit target $${AUTO_SETTINGS.dailyTP} reached – cooldown 2h`);
     state.cooldownUntil = now + AUTO_SETTINGS.cooldownMs;
@@ -419,10 +494,8 @@ function autoTicker(symbol, price) {
 
   if (!state.autoActive) return;
 
-  // Scan for new signals
   scanForSignals();
 
-  // Process each session
   const digit = parseInt(parseFloat(price).toFixed(MARKETS[symbol].dp).slice(-1));
   for (const session of state.autoSessions) {
     if (session.market !== symbol) continue;
@@ -439,7 +512,6 @@ function autoTicker(symbol, price) {
       if (!allMatch) continue;
     }
 
-    // Place trade
     session.waitingForResult = true;
     const contractType = session.direction === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
     addLog(`🤖 Placing ${contractType} barrier ${session.barrier} on ${MARKETS[symbol].name}`);
@@ -458,15 +530,16 @@ function autoTicker(symbol, price) {
       req_id: currentReqId,
     });
 
-    // Map the req_id to this session
     pendingAutoReqs.set(currentReqId, session);
     session.lastTradeTime = now;
   }
 }
 
-// ---------- Handle contract settlement for auto‑trader ----------
+// ---------- Contract settlement (corrected win/loss logging) ----------
 function handleAutoContractSettlement(contract, session) {
-  const profit = parseFloat(contract.profit) || 0;
+  const rawProfit = contract.profit;
+  const profit = (typeof rawProfit === 'number') ? rawProfit : parseFloat(rawProfit) || 0;
+
   state.dailyPnL += profit;
   session.sessionProfit += profit;
 
@@ -486,7 +559,6 @@ function handleAutoContractSettlement(contract, session) {
     }
   }
 
-  // Check termination
   if (session.consecutiveLosses >= AUTO_SETTINGS.maxConsecutiveLossesPerSession) {
     endSession(session, 'max consecutive losses');
   } else if (session.sessionProfit >= AUTO_SETTINGS.sessionProfitTarget && !AUTO_SETTINGS.trailingStopEnabled) {
@@ -494,14 +566,13 @@ function handleAutoContractSettlement(contract, session) {
   } else if (AUTO_SETTINGS.trailingStopEnabled && session.stopLevel !== null && session.sessionProfit <= session.stopLevel) {
     endSession(session, 'trailing stop');
   } else {
-    // Session continues
     session.waitingForResult = false;
     session.pendingContractId = null;
   }
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- SSE endpoint ----------
+// ---------- SSE / API endpoints ----------
 app.get('/api/logs', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -518,7 +589,6 @@ app.get('/api/state', (req, res) => {
   res.json({ ...state, logs: undefined });
 });
 
-// ---------- Manual trading control (unchanged) ----------
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
@@ -565,7 +635,6 @@ app.post('/api/control', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- Auto‑trade control ----------
 app.post('/api/auto', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
@@ -574,7 +643,7 @@ app.post('/api/auto', (req, res) => {
     }
     state.autoActive = true;
     state.autoSessions = [];
-    addLog('🤖 Auto‑trading started (improved)');
+    addLog('🤖 Auto‑trading started (dynamic barrier)');
   } else if (action === 'stop') {
     state.autoActive = false;
     state.autoSessions = [];
@@ -644,7 +713,6 @@ function handleDerivMessage(msg) {
 
     if (analyzers[symbol]) autoTicker(symbol, price);
 
-    // Manual trading (unchanged)
     if (state.active && symbol === state.marketSymbol) {
       state.latestTick = price;
       const formatted = parseFloat(price).toFixed(state.dp);
@@ -658,8 +726,11 @@ function handleDerivMessage(msg) {
         let tradeNow = false, triggerReason = '';
         if (state.triggerMode === 'single') {
           const triggerSet = state.triggerDigits.split(',').map(d => d.trim()).filter(d => d !== '');
-          if (triggerSet.length === 0) { tradeNow = true; triggerReason = 'all'; }
-          else if (triggerSet.includes(state.lastDigit)) { tradeNow = true; triggerReason = `single: ${state.lastDigit}`; }
+          if (triggerSet.length === 0) {
+            tradeNow = true; triggerReason = 'all';
+          } else if (triggerSet.includes(state.lastDigit)) {
+            tradeNow = true; triggerReason = `single: ${state.lastDigit}`;
+          }
         } else if (state.triggerMode === 'cluster') {
           if (state.lastDigitsBuffer.length === state.clusterSize) {
             const clusterSet = state.clusterDigits.split(',').map(d => d.trim()).filter(d => d !== '');
@@ -703,16 +774,10 @@ function handleDerivMessage(msg) {
     send({ buy: proposalId, price: askPrice, req_id: ++reqId });
   } else if (msg.msg_type === 'buy') {
     const contractId = msg.buy.contract_id;
-    // Identify if manual or auto
     if (state.active && state.waitingForResult && !state.pendingContractId) {
       state.pendingContractId = contractId;
       addLog(`Manual contract ${contractId} opened.`);
     } else {
-      // Find the auto session via pending req_id
-      // The buy response does not contain the original req_id, but we can use the buy's echo_req if available.
-      // Since we can't easily map the buy response to a session without the original req_id, we'll use a different approach:
-      // We'll store the contractId and later, when proposal_open_contract comes, we'll match it to sessions that are waiting.
-      // For now, just find the first waiting session that hasn't a contract yet.
       let found = false;
       for (const [reqId, session] of pendingAutoReqs) {
         if (session.waitingForResult && !session.pendingContractId) {
@@ -723,7 +788,6 @@ function handleDerivMessage(msg) {
           break;
         }
       }
-      // Fallback (should not happen) – find any waiting session
       if (!found) {
         for (const session of state.autoSessions) {
           if (session.waitingForResult && !session.pendingContractId) {
@@ -734,7 +798,6 @@ function handleDerivMessage(msg) {
         }
       }
     }
-    // Subscribe to contract updates
     send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: ++reqId });
   } else if (msg.msg_type === 'proposal_open_contract') {
     const c = msg.proposal_open_contract;
