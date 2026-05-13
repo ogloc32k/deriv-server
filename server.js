@@ -247,6 +247,8 @@ const AUTO_SETTINGS = {
   volatilityFilterEnabled: true,
   volatilityFilterThreshold: 0.001,
   sessionTimeoutMs: 15 * 60 * 1000,
+  maxOverBarrier: 4,     // over barriers 0‑4 only
+  minUnderBarrier: 6,    // under barriers 6‑9 only
 };
 
 let globalAvgVolatility = 0.0001;
@@ -300,20 +302,21 @@ function selectOptimalBarrier(direction, freq) {
   let bestBarrier = null, bestProfit = -Infinity;
 
   if (direction === 'over') {
-    for (let n = 0; n <= 8; n++) {
+    for (let n = 0; n <= AUTO_SETTINGS.maxOverBarrier; n++) {
       let winProb = 0;
       for (let d = n + 1; d <= 9; d++) winProb += (freq[d] || 0);
       const profit = winProb * getFairPayoutOver(n) - 1;
       if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
     }
   } else {
-    for (let n = 1; n <= 9; n++) {
+    for (let n = AUTO_SETTINGS.minUnderBarrier; n <= 9; n++) {
       let winProb = 0;
       for (let d = 0; d < n; d++) winProb += (freq[d] || 0);
       const profit = winProb * getFairPayoutUnder(n) - 1;
       if (profit > bestProfit) { bestProfit = profit; bestBarrier = n; }
     }
   }
+
   if (bestProfit <= 0) return null;
   return { barrier: bestBarrier, expectedProfit: bestProfit };
 }
@@ -803,7 +806,8 @@ function handleDerivMessage(msg) {
     const c = msg.proposal_open_contract;
     // Manual settlement
     if (state.active && state.waitingForResult && c.contract_id === state.pendingContractId) {
-      const profit = parseFloat(c.profit) || 0;
+      const rawProfit = c.profit;
+      const profit = (typeof rawProfit === 'number') ? rawProfit : parseFloat(rawProfit) || 0;
       state.runningProfit += profit;
       addLog(`Manual settled: ${profit >= 0 ? 'WIN' : 'LOSS'} | Profit: ${profit.toFixed(2)}`);
       if (profit < 0) {
