@@ -89,7 +89,7 @@ app.post('/api/control', (req, res) => {
   if (action === 'start') {
     state.active = true;
     state.runningProfit = 0;
-    state.currentStake = state.stake;
+    state.currentStake = Math.max(state.stake, 0.35);  // enforce minimum
     state.waitingForResult = false;
     state.pendingContractId = null;
     state.lastDigitsBuffer = [];
@@ -119,8 +119,8 @@ app.post('/api/control', (req, res) => {
     if (barrierDigit !== undefined) state.barrierDigit = String(barrierDigit);
     if (directionOverUnder) state.directionOverUnder = directionOverUnder;
     if (stake !== undefined) {
-      state.stake = parseFloat(stake);
-      if (!state.active) state.currentStake = parseFloat(stake);
+      state.stake = Math.max(parseFloat(stake), 0.35);
+      if (!state.active) state.currentStake = state.stake;
     }
     if (martingale !== undefined) state.martingale = parseFloat(martingale);
     if (takeProfit !== undefined) state.takeProfit = parseFloat(takeProfit);
@@ -194,6 +194,11 @@ function handleDerivMessage(msg) {
       state.formattedPrice = formatted;
       state.lastDigit = formatted.slice(-1);
 
+      // If we are waiting for a result, this is the outcome tick – log it
+      if (state.waitingForResult) {
+        addLog(`Outcome tick: ${formatted} (last digit: ${state.lastDigit})`);
+      }
+
       if (!state.waitingForResult) {
         state.lastDigitsBuffer.push(state.lastDigit);
         if (state.lastDigitsBuffer.length > state.clusterSize) state.lastDigitsBuffer.shift();
@@ -211,6 +216,7 @@ function handleDerivMessage(msg) {
             const clusterSet = state.clusterDigits.split(',').map(d => d.trim()).filter(d => d !== '');
             if (clusterSet.length === 0 || state.lastDigitsBuffer.every(d => clusterSet.includes(d))) {
               tradeNow = true;
+              triggerReason = 'cluster';
             }
           }
         }
@@ -218,10 +224,13 @@ function handleDerivMessage(msg) {
           state.waitingForResult = true;
           const contractType = state.directionOverUnder === 'over' ? 'DIGITOVER' : 'DIGITUNDER';
           const barrier = parseInt(state.barrierDigit);
-          addLog(`Manual: Placing ${contractType} barrier ${barrier} | trigger: ${triggerReason || 'cluster'}`);
+
+          // ensure minimum stake
+          const stakeToUse = Math.max(state.currentStake, 0.35);
+          addLog(`Manual: Placing ${contractType} barrier ${barrier} | trigger: ${triggerReason} | stake: ${stakeToUse.toFixed(2)}`);
           send({
             proposal: 1,
-            amount: state.currentStake,
+            amount: stakeToUse,
             basis: 'stake',
             currency: state.currency || 'USD',
             duration: 1,
@@ -239,6 +248,10 @@ function handleDerivMessage(msg) {
   else if (msg.msg_type === 'proposal') {
     const proposalId = msg.proposal.id;
     const askPrice = msg.proposal.ask_price;
+    // Log if the actual price differs from what we wanted
+    if (askPrice !== state.currentStake) {
+      addLog(`Note: Deriv ask price ${askPrice} differs from requested stake ${state.currentStake.toFixed(2)}`);
+    }
     addLog(`Proposal received. Buying at ${askPrice}`);
     send({ buy: proposalId, price: askPrice, req_id: ++reqId });
   }
@@ -251,14 +264,16 @@ function handleDerivMessage(msg) {
   else if (msg.msg_type === 'proposal_open_contract') {
     const c = msg.proposal_open_contract;
     if (state.active && state.waitingForResult && c.contract_id === state.pendingContractId) {
-      const rawProfit = c.profit;
-      const netProfit = (typeof rawProfit === 'number') ? rawProfit : parseFloat(rawProfit) || 0;
+      // Raw settlement data for debugging
+      addLog(`Settlement raw: buy_price=${c.buy_price}, payout=${c.payout}, profit=${c.profit}`);
+
+      const netProfit = typeof c.profit === 'number' ? c.profit : parseFloat(c.profit) || 0;
       state.runningProfit += netProfit;
 
       if (netProfit > 0) {
-        addLog(`Settled: WIN | Profit: +${netProfit.toFixed(2)} | Total: ${state.runningProfit.toFixed(2)}`);
+        addLog(`Settled: WIN | Net profit: +${netProfit.toFixed(2)} | Total: ${state.runningProfit.toFixed(2)}`);
       } else if (netProfit < 0) {
-        addLog(`Settled: LOSS | Stake lost: ${(-netProfit).toFixed(2)} | Total: ${state.runningProfit.toFixed(2)}`);
+        addLog(`Settled: LOSS | Amount lost: ${(-netProfit).toFixed(2)} | Total: ${state.runningProfit.toFixed(2)}`);
       } else {
         addLog(`Settled: DRAW | Total: ${state.runningProfit.toFixed(2)}`);
       }
@@ -266,13 +281,14 @@ function handleDerivMessage(msg) {
       // Martingale logic
       if (netProfit < 0) {
         state.currentStake = Math.round(state.currentStake * state.martingale * 100) / 100;
+        state.currentStake = Math.max(state.currentStake, 0.35);  // minimum
       } else {
         state.currentStake = state.stake;
       }
+
       state.pendingContractId = null;
       state.waitingForResult = false;
 
-      // Check TP/SL
       if (state.runningProfit >= state.takeProfit) {
         addLog(`Take profit reached (${state.runningProfit.toFixed(2)}). Stopping.`);
         state.active = false;
