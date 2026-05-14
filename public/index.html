@@ -8,7 +8,7 @@
   .container { max-width:750px; margin:auto; }
   .stat { background:#222; padding:15px; border-radius:8px; margin:10px 0; }
   .big { font-size:28px; font-weight:bold; }
-  .green { color:#4caf50; } .red { color:#f44336; } .orange { color:#ff9800; } .blue { color:#42a5f5; }
+  .green { color:#4caf50; } .red { color:#f44336; } .orange { color:#ff9800; }
   .btn { padding:15px 30px; margin:5px; border:none; border-radius:5px; font-weight:bold; cursor:pointer; }
   .btn-start { background:#4caf50; color:white; } .btn-stop { background:#f44336; color:white; }
   .btn:disabled { opacity:0.4; }
@@ -17,40 +17,49 @@
   .settings label { display:block; margin-top:5px; }
   table { width:100%; border-collapse:collapse; margin-top:10px; }
   th, td { padding:6px; border-bottom:1px solid #333; text-align:center; }
-  .highlight { background:#333; }
 </style>
 </head>
 <body>
 <div class="container">
   <h2>Professional Mode</h2>
+
   <div class="stat">
     <div>Balance: <span id="balance" class="big green">--</span></div>
     <div>Daily P&L: <span id="dailyPnl" class="big">--</span></div>
-    <div>Active trades: <span id="activeCount" class="big orange">0</span></div>
+    <div>Phase <span id="phaseNum">1</span>/<span id="phaseTotal">3</span> | P&L: <span id="phasePnl">0.00</span></div>
+    <div>Cooldown: <span id="cooldownDisplay">--</span></div>
     <div id="lockStatus" class="red" style="display:none;">⚠️ Daily limit reached – bot locked</div>
   </div>
+
   <div class="stat">
     <div class="settings">
-      <label>Min Confidence % <input id="minConf" type="number" value="45" min="35" max="65"></label>
-      <label>Risk % per trade <input id="riskPct" type="number" value="1.5" step="0.5"></label>
-      <label>Daily Stop Loss % <input id="dailySL" type="number" value="6"></label>
-      <label>Daily Take Profit % <input id="dailyTP" type="number" value="20"></label>
-      <label>Max concurrent <input id="maxConc" type="number" value="2" min="1" max="3"></label>
+      <label>Min Confidence % <input id="minConf" type="number" value="45"></label>
+      <label>Risk % <input id="riskPct" type="number" value="1.5" step="0.5"></label>
+      <label>Daily SL % <input id="dailySL" type="number" value="6"></label>
+      <label>Daily TP % <input id="dailyTP" type="number" value="10"></label>
+      <label>Phases <input id="phaseCount" type="number" value="3"></label>
+      <label>Phase Target % <input id="phaseTarget" type="number" value="3.33" step="0.01"></label>
+      <label>Phase Loss % <input id="phaseLoss" type="number" value="2" step="0.1"></label>
+      <label>Cooldown (min) <input id="cooldownMin" type="number" value="120"></label>
       <label>Trend filter <input id="trendFilter" type="checkbox" checked></label>
     </div>
   </div>
+
   <div>
     <button class="btn btn-start" id="startBtn" onclick="start()">Start Trading</button>
     <button class="btn btn-stop" id="stopBtn" onclick="stop()" disabled>Stop Trading</button>
   </div>
+
   <h3>Live Confidence</h3>
   <table>
     <tr><th>Market</th><th>Over %</th><th>Under %</th><th>Trend</th><th>Best</th></tr>
     <tbody id="signalTable"></tbody>
   </table>
+
   <h3>Logs</h3>
   <div id="logs"></div>
 </div>
+
 <script>
 const es = new EventSource('/api/logs');
 es.onmessage = e => {
@@ -65,39 +74,78 @@ es.onmessage = e => {
     });
   }
 };
+
 const marketOrder = ['R_10','R_25','R_50','R_75','R_100'];
+
 function updateUI(s) {
   document.getElementById('balance').textContent = s.balance ? `${parseFloat(s.balance).toFixed(2)} ${s.currency}` : '--';
   document.getElementById('dailyPnl').textContent = s.dailyPnl !== undefined ? `${s.dailyPnl.toFixed(2)} USD` : '--';
-  document.getElementById('activeCount').textContent = s.activeTrades ? s.activeTrades.length : 0;
+  document.getElementById('phaseNum').textContent = s.currentPhase || 1;
+  document.getElementById('phaseTotal').textContent = s.phaseCount || 3;
+  document.getElementById('phasePnl').textContent = s.phasePnl !== undefined ? s.phasePnl.toFixed(2) : '0.00';
+
+  const cooldownEl = document.getElementById('cooldownDisplay');
+  if (s.cooldownUntil) {
+    const remaining = Math.max(0, s.cooldownUntil - Date.now());
+    const mins = Math.floor(remaining/60000);
+    const secs = Math.floor((remaining%60000)/1000);
+    cooldownEl.textContent = `Cooling down – ${mins}:${secs.toString().padStart(2,'0')}`;
+  } else {
+    cooldownEl.textContent = '--';
+  }
+
   document.getElementById('lockStatus').style.display = s.locked ? 'block' : 'none';
-  document.getElementById('startBtn').disabled = s.active;
-  document.getElementById('stopBtn').disabled = !s.active;
+  const running = s.active;
+  document.getElementById('startBtn').disabled = running || s.sessionAlreadyUsedToday;
+  document.getElementById('stopBtn').disabled = !running;
+
+  // Disable settings while running
+  const inputs = document.querySelectorAll('.settings input, .settings select');
+  inputs.forEach(inp => inp.disabled = running);
+
   const tbody = document.getElementById('signalTable'); tbody.innerHTML = '';
   if (s.marketSignals) {
     for (const sym of marketOrder) {
       const sig = s.marketSignals[sym]; if (!sig) continue;
       const tr = document.createElement('tr');
-      const bestDir = sig.bestDirection === 'over' ? '↑' : (sig.bestDirection === 'under' ? '↓' : '');
-      const trendIcon = sig.trend === 'up' ? '↑' : (sig.trend === 'down' ? '↓' : '→');
+      const bestDir = sig.bestDirection==='over'?'↑': (sig.bestDirection==='under'?'↓':'');
+      const trendIcon = sig.trend==='up'?'↑': (sig.trend==='down'?'↓':'→');
       tr.innerHTML = `<td>${sym}</td><td>${sig.over}%</td><td>${sig.under}%</td><td>${trendIcon}</td><td class="orange">${bestDir} ${sig.bestConf}%</td>`;
       tbody.appendChild(tr);
     }
   }
 }
+
+setInterval(() => {
+  fetch('/api/state').then(r=>r.json()).then(s => {
+    if (s.cooldownUntil) {
+      const remaining = Math.max(0, s.cooldownUntil - Date.now());
+      const mins = Math.floor(remaining/60000);
+      const secs = Math.floor((remaining%60000)/1000);
+      document.getElementById('cooldownDisplay').textContent = `Cooling down – ${mins}:${secs.toString().padStart(2,'0')}`;
+    }
+  });
+}, 1000);
+
 function start() {
   const config = {
     minConfidence: document.getElementById('minConf').value,
     riskPct: document.getElementById('riskPct').value,
     dailyStopLossPct: document.getElementById('dailySL').value,
     dailyTakeProfitPct: document.getElementById('dailyTP').value,
-    maxConcurrent: document.getElementById('maxConc').value,
+    phaseCount: document.getElementById('phaseCount').value,
+    phaseTargetPct: document.getElementById('phaseTarget').value,
+    phaseLossPct: document.getElementById('phaseLoss').value,
+    cooldownMinutes: document.getElementById('cooldownMin').value,
     trendFilterEnabled: document.getElementById('trendFilter').checked
   };
-  fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'update', ...config})})
-    .then(() => fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'start'})}));
+  fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'update',...config})})
+    .then(() => fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'start'})}))
+    .catch(err => alert(err));
 }
-function stop() { fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'})}); }
+function stop() {
+  fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'})});
+}
 </script>
 </body>
 </html>
